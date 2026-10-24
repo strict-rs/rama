@@ -32,7 +32,7 @@ fn connection(
     builder: http1::Builder,
 ) -> (
     tokio::io::DuplexStream,
-    JoinHandle<rama::http::core::Result<()>>,
+    JoinHandle<rama::http::core::Result<(), rama::error::ArcError>>,
 ) {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let task = tokio::spawn(async move {

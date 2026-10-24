@@ -1,18 +1,18 @@
-use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::sync::atomic::{self, AtomicBool};
 use std::task::{Context, Poll, ready};
+use std::{convert::Infallible, mem::ManuallyDrop};
 
 use pin_project_lite::pin_project;
-use rama_core::error::BoxError;
 use rama_core::telemetry::tracing::{self, trace};
 use rama_http_types::{Request, Response, StreamingBody};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{body::Incoming, proto::h2::client::ResponseFutMap};
 
-pub(crate) type RetryPromise<T, U> = oneshot::Receiver<Result<U, TrySendError<T>>>;
-pub(crate) type Promise<T> = oneshot::Receiver<Result<T, crate::Error>>;
+pub(crate) type RetryPromise<T, U, E = Infallible> =
+    oneshot::Receiver<Result<U, TrySendError<T, E>>>;
+pub(crate) type Promise<T, E = Infallible> = oneshot::Receiver<Result<T, crate::Error<E>>>;
 
 /// An error when calling `try_send_request`.
 ///
@@ -21,12 +21,12 @@ pub(crate) type Promise<T> = oneshot::Receiver<Result<T, crate::Error>>;
 /// transport. If that happens, it is safe to return the request back to the
 /// caller, as it was never fully sent.
 #[derive(Debug)]
-pub struct TrySendError<T> {
-    pub(crate) error: crate::Error,
+pub struct TrySendError<T, E = Infallible> {
+    pub(crate) error: crate::Error<E>,
     pub(crate) message: Option<T>,
 }
 
-pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
+pub(crate) fn channel<T, U, E>() -> (Sender<T, U, E>, Receiver<T, U, E>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let (giver, taker) = want::new();
     let tx = Sender {
@@ -42,7 +42,7 @@ pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
 ///
 /// While the inner sender is unbounded, the Giver is used to determine
 /// if the Receiver is ready for another request.
-pub(crate) struct Sender<T, U> {
+pub(crate) struct Sender<T, U, E = Infallible> {
     /// One message is always allowed, even if the Receiver hasn't asked
     /// for it yet. This boolean keeps track of whether we've sent one
     /// without notice.
@@ -53,21 +53,21 @@ pub(crate) struct Sender<T, U> {
     /// for more.
     giver: want::Giver,
     /// Actually bounded by the Giver, plus `buffered_once`.
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: mpsc::UnboundedSender<Envelope<T, U, E>>,
 }
 
 /// An unbounded version.
 ///
 /// Cannot poll the Giver, but can still use it to determine if the Receiver
 /// has been dropped. However, this version can be cloned.
-pub(crate) struct UnboundedSender<T, U> {
+pub(crate) struct UnboundedSender<T, U, E = Infallible> {
     /// Only used for `is_closed`, since `mpsc::UnboundedSender` cannot be checked.
     giver: want::SharedGiver,
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: mpsc::UnboundedSender<Envelope<T, U, E>>,
 }
 
-impl<T, U> Sender<T, U> {
-    pub(crate) fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+impl<T, U, E> Sender<T, U, E> {
+    pub(crate) fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<(), E>> {
         self.giver
             .poll_want(cx)
             .map_err(|_| crate::Error::new_closed())
@@ -90,7 +90,7 @@ impl<T, U> Sender<T, U> {
     }
 
     #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
+    pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U, E>, T> {
         if !self.can_send() {
             return Err(val);
         }
@@ -101,7 +101,7 @@ impl<T, U> Sender<T, U> {
             .map_err(|mpsc::error::SendError(env)| env.into_value())
     }
 
-    pub(crate) fn send(&self, val: T) -> Result<Promise<U>, T> {
+    pub(crate) fn send(&self, val: T) -> Result<Promise<U, E>, T> {
         if !self.can_send() {
             return Err(val);
         }
@@ -112,7 +112,7 @@ impl<T, U> Sender<T, U> {
             .map_err(|mpsc::error::SendError(env)| env.into_value())
     }
 
-    pub(crate) fn unbound(self) -> UnboundedSender<T, U> {
+    pub(crate) fn unbound(self) -> UnboundedSender<T, U, E> {
         UnboundedSender {
             giver: self.giver.shared(),
             inner: self.inner,
@@ -120,7 +120,7 @@ impl<T, U> Sender<T, U> {
     }
 }
 
-impl<T, U> UnboundedSender<T, U> {
+impl<T, U, E> UnboundedSender<T, U, E> {
     pub(crate) fn is_ready(&self) -> bool {
         !self.giver.is_canceled()
     }
@@ -130,7 +130,7 @@ impl<T, U> UnboundedSender<T, U> {
     }
 
     #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
+    pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U, E>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .send(Envelope::new(val, Callback::retry(tx)))
@@ -138,7 +138,7 @@ impl<T, U> UnboundedSender<T, U> {
             .map_err(|mpsc::error::SendError(env)| env.into_value())
     }
 
-    pub(crate) fn send(&self, val: T) -> Result<Promise<U>, T> {
+    pub(crate) fn send(&self, val: T) -> Result<Promise<U, E>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .send(Envelope::new(val, Callback::no_retry(tx)))
@@ -147,7 +147,7 @@ impl<T, U> UnboundedSender<T, U> {
     }
 }
 
-impl<T, U> Clone for UnboundedSender<T, U> {
+impl<T, U, E> Clone for UnboundedSender<T, U, E> {
     fn clone(&self) -> Self {
         Self {
             giver: self.giver.clone(),
@@ -156,13 +156,16 @@ impl<T, U> Clone for UnboundedSender<T, U> {
     }
 }
 
-pub(crate) struct Receiver<T, U> {
-    inner: mpsc::UnboundedReceiver<Envelope<T, U>>,
+pub(crate) struct Receiver<T, U, E = Infallible> {
+    inner: mpsc::UnboundedReceiver<Envelope<T, U, E>>,
     taker: want::Taker,
 }
 
-impl<T, U> Receiver<T, U> {
-    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(T, Callback<T, U>)>> {
+impl<T, U, E> Receiver<T, U, E> {
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(T, Callback<T, U, E>)>> {
         match self.inner.poll_recv(cx) {
             Poll::Ready(item) => {
                 // A want signaled on an empty or budget-starved poll can outlive the message
@@ -190,7 +193,7 @@ impl<T, U> Receiver<T, U> {
         Poll::Ready(())
     }
 
-    pub(crate) fn try_recv(&mut self) -> Option<(T, Callback<T, U>)> {
+    pub(crate) fn try_recv(&mut self) -> Option<(T, Callback<T, U, E>)> {
         match rama_core::rt::future::now_or_never(self.inner.recv()) {
             Some(Some(env)) => Some(env.into_inner()),
             _ => None,
@@ -198,7 +201,7 @@ impl<T, U> Receiver<T, U> {
     }
 }
 
-impl<T, U> Drop for Receiver<T, U> {
+impl<T, U, E> Drop for Receiver<T, U, E> {
     fn drop(&mut self) {
         // Notify the giver about the closure first, before dropping
         // the mpsc::Receiver.
@@ -206,13 +209,13 @@ impl<T, U> Drop for Receiver<T, U> {
     }
 }
 
-struct Envelope<T, U> {
-    data: ManuallyDrop<(T, Callback<T, U>)>,
+struct Envelope<T, U, E = Infallible> {
+    data: ManuallyDrop<(T, Callback<T, U, E>)>,
     used: bool,
 }
 
-impl<T, U> Envelope<T, U> {
-    fn new(val: T, cb: Callback<T, U>) -> Self {
+impl<T, U, E> Envelope<T, U, E> {
+    fn new(val: T, cb: Callback<T, U, E>) -> Self {
         Self {
             data: ManuallyDrop::new((val, cb)),
             used: false,
@@ -220,7 +223,7 @@ impl<T, U> Envelope<T, U> {
     }
 
     #[inline(always)]
-    fn into_inner(mut self) -> (T, Callback<T, U>) {
+    fn into_inner(mut self) -> (T, Callback<T, U, E>) {
         debug_assert!(!self.used, "SAFETY: not used used at this point");
         self.used = true;
         unsafe { ManuallyDrop::take(&mut self.data) }
@@ -232,34 +235,34 @@ impl<T, U> Envelope<T, U> {
     }
 }
 
-impl<T, U> Drop for Envelope<T, U> {
+impl<T, U, E> Drop for Envelope<T, U, E> {
     fn drop(&mut self) {
         if !self.used {
             // SAFETY: only if consumed it will be used,
             // otherwise not taken yet and we can do so now
             let (val, cb) = unsafe { ManuallyDrop::take(&mut self.data) };
             cb.send(Err(TrySendError {
-                error: crate::Error::new_canceled().with("connection closed"),
+                error: crate::Error::new_canceled().with(crate::StateFailure::ConnectionClosed),
                 message: Some(val),
             }));
         }
     }
 }
 
-pub(crate) struct Callback<T, U> {
-    cb: ManuallyDrop<InnerCallback<T, U>>,
+pub(crate) struct Callback<T, U, E = Infallible> {
+    cb: ManuallyDrop<InnerCallback<T, U, E>>,
     used: bool,
 }
 
-impl<T, U> Callback<T, U> {
-    pub(crate) fn retry(tx: oneshot::Sender<Result<U, TrySendError<T>>>) -> Self {
+impl<T, U, E> Callback<T, U, E> {
+    pub(crate) fn retry(tx: oneshot::Sender<Result<U, TrySendError<T, E>>>) -> Self {
         Self {
             cb: ManuallyDrop::new(InnerCallback::Retry(tx)),
             used: false,
         }
     }
 
-    pub(crate) fn no_retry(tx: oneshot::Sender<Result<U, crate::Error>>) -> Self {
+    pub(crate) fn no_retry(tx: oneshot::Sender<Result<U, crate::Error<E>>>) -> Self {
         Self {
             cb: ManuallyDrop::new(InnerCallback::NoRetry(tx)),
             used: false,
@@ -267,12 +270,12 @@ impl<T, U> Callback<T, U> {
     }
 }
 
-pub(crate) enum InnerCallback<T, U> {
-    Retry(oneshot::Sender<Result<U, TrySendError<T>>>),
-    NoRetry(oneshot::Sender<Result<U, crate::Error>>),
+pub(crate) enum InnerCallback<T, U, E = Infallible> {
+    Retry(oneshot::Sender<Result<U, TrySendError<T, E>>>),
+    NoRetry(oneshot::Sender<Result<U, crate::Error<E>>>),
 }
 
-impl<T, U> Drop for Callback<T, U> {
+impl<T, U, E> Drop for Callback<T, U, E> {
     fn drop(&mut self) {
         if !self.used {
             // SAFETY: guaranteed by API to be not yet used
@@ -286,16 +289,14 @@ impl<T, U> Drop for Callback<T, U> {
 }
 
 #[cold]
-fn dispatch_gone() -> crate::Error {
+fn dispatch_gone<E>() -> crate::Error<E> {
     // FIXME(nox): What errors do we want here?
-    crate::Error::new_user_dispatch_gone().with(if std::thread::panicking() {
-        "user code panicked"
-    } else {
-        "runtime dropped the dispatch task"
+    crate::Error::new_user_dispatch_gone().with(crate::StateFailure::DispatchDropped {
+        panicking: std::thread::panicking(),
     })
 }
 
-impl<T, U> Callback<T, U> {
+impl<T, U, E> Callback<T, U, E> {
     pub(crate) fn is_canceled(&self) -> bool {
         match &*self.cb {
             InnerCallback::Retry(tx) => tx.is_closed(),
@@ -311,7 +312,7 @@ impl<T, U> Callback<T, U> {
     }
 
     #[inline(always)]
-    pub(crate) fn send(mut self, val: Result<U, TrySendError<T>>) {
+    pub(crate) fn send(mut self, val: Result<U, TrySendError<T, E>>) {
         debug_assert!(!self.used, "SAFETY: not used used at this point");
         self.used = true;
         let cb = unsafe { ManuallyDrop::take(&mut self.cb) };
@@ -319,8 +320,8 @@ impl<T, U> Callback<T, U> {
     }
 }
 
-impl<T, U> InnerCallback<T, U> {
-    fn send(self, val: Result<U, TrySendError<T>>) {
+impl<T, U, E> InnerCallback<T, U, E> {
+    fn send(self, val: Result<U, TrySendError<T, E>>) {
         match self {
             Self::Retry(tx) => {
                 if tx.send(val).is_err() {
@@ -336,7 +337,7 @@ impl<T, U> InnerCallback<T, U> {
     }
 }
 
-impl<T> TrySendError<T> {
+impl<T, E> TrySendError<T, E> {
     /// Take the message from this error.
     ///
     /// The message will not always have been recovered. If an error occurs
@@ -347,7 +348,7 @@ impl<T> TrySendError<T> {
     }
 
     /// Consumes this to return the inner error.
-    pub fn into_error(self) -> crate::Error {
+    pub fn into_error(self) -> crate::Error<E> {
         self.error
     }
 }
@@ -361,18 +362,24 @@ pin_project! {
         B: Unpin,
         B::Data: Send,
         B::Data: 'static,
-        B::Error: Into<BoxError>,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
     {
         #[pin]
         pub(crate) when: ResponseFutMap<B>,
         #[pin]
-        pub(crate) call_back: Option<Callback<Request<B>, Response<Incoming>>>,
+        pub(crate) call_back: Option<Callback<Request<B>, Response<Incoming<B::Error>>, B::Error>>,
     }
 }
 
 impl<B> Future for SendWhen<B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     type Output = ();
 
@@ -456,7 +463,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn drop_receiver_sends_cancel_errors() {
-        let (mut tx, mut rx) = channel::<Custom, ()>();
+        let (mut tx, mut rx) = channel::<Custom, (), std::convert::Infallible>();
 
         // must poll once for try_send to succeed
         assert!(PollOnce(&mut rx).await.is_none(), "rx empty");
@@ -477,7 +484,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn poll_close_cancels_queued_messages_without_a_drop() {
-        let (tx, mut rx) = channel::<Custom, ()>();
+        let (tx, mut rx) = channel::<Custom, (), std::convert::Infallible>();
         let mut tx = tx.unbound();
         let promise = tx.try_send(Custom(1)).unwrap();
 
@@ -509,7 +516,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn sender_checks_for_want_on_send() {
-        let (mut tx, mut rx) = channel::<Custom, ()>();
+        let (mut tx, mut rx) = channel::<Custom, (), std::convert::Infallible>();
 
         // one is allowed to buffer, second is rejected
         tx.try_send(Custom(1)).expect("1 buffered");
@@ -528,7 +535,7 @@ mod tests {
 
     #[test]
     fn unbounded_sender_doesnt_bound_on_want() {
-        let (tx, rx) = channel::<Custom, ()>();
+        let (tx, rx) = channel::<Custom, (), std::convert::Infallible>();
         let mut tx = tx.unbound();
 
         tx.try_send(Custom(1)).unwrap();

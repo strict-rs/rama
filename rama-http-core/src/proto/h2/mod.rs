@@ -8,7 +8,6 @@ use std::{
 use pin_project_lite::pin_project;
 use rama_core::{
     bytes::Buf,
-    error::BoxError,
     telemetry::tracing::{debug, trace},
 };
 use rama_http::StreamingBody;
@@ -144,9 +143,9 @@ where
 impl<S> Future for PipeToSendStream<S>
 where
     S: StreamingBody,
-    S::Error: Into<BoxError>,
+    S::Error: std::error::Error + Send + Sync + 'static + std::fmt::Debug,
 {
-    type Output = crate::Result<()>;
+    type Output = crate::Result<(), S::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut me = self.project();
@@ -179,7 +178,7 @@ where
                             // streaming state, we either finished it
                             // somehow, or the remote reset us.
                             return Poll::Ready(Err(crate::Error::new_body_write(
-                                "send stream capacity unexpectedly closed",
+                                crate::StateFailure::SendCapacityClosed,
                             )));
                         }
                     }
@@ -270,7 +269,11 @@ where
                     // no more frames means we're done here
                     // but at this point, we haven't sent an EOS DATA, or
                     // any trailers, so send an empty EOS DATA.
-                    return Poll::Ready(me.body_tx.send_eos_frame());
+                    return Poll::Ready(
+                        me.body_tx
+                            .send_eos_frame()
+                            .map_err(crate::Error::into_body_error),
+                    );
                 }
             }
         }
@@ -297,16 +300,16 @@ fn filter_allowed_trailers(trailers: HeaderMap, allowed: Option<&ForbiddenTraile
 }
 
 trait SendStreamExt {
-    fn on_user_err<E>(&mut self, err: E) -> crate::Error
+    fn on_user_err<E>(&mut self, err: E) -> crate::Error<E>
     where
-        E: Into<BoxError>;
+        E: std::error::Error + Send + Sync + 'static;
     fn send_eos_frame(&mut self) -> crate::Result<()>;
 }
 
 impl<B: Buf> SendStreamExt for SendStream<SendBuf<B>> {
-    fn on_user_err<E>(&mut self, err: E) -> crate::Error
+    fn on_user_err<E>(&mut self, err: E) -> crate::Error<E>
     where
-        E: Into<BoxError>,
+        E: std::error::Error + Send + Sync + 'static,
     {
         let err = crate::Error::new_user_body(err);
         debug!("send body user stream error: {:?}", err);

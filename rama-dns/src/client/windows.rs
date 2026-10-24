@@ -32,7 +32,7 @@ use windows_sys::core::PCWSTR;
 use std::sync::atomic::AtomicU16;
 
 use super::{
-    in_flight::{Abandoned, InFlight, coalesced_stream, leading_dot_refusal},
+    in_flight::{Abandoned, RecordFlights, SharedRecord, coalesced_stream, leading_dot_refusal},
     limit::{DnsTimeoutError, Limits, LookupLimit, deadline_after},
     resolver::{
         DnsAddressResolver, DnsCnameResolver, DnsResolver, DnsServiceBindingResolver,
@@ -101,7 +101,7 @@ const _: () = assert!(std::mem::size_of::<DnsBackend>() == 0);
 pub struct WindowsDnsResolver {
     timeout: Duration,
     limit: LookupLimit,
-    in_flight: InFlight<(Domain, u16)>,
+    in_flight: RecordFlights<(Domain, u16)>,
 }
 
 impl Default for WindowsDnsResolver {
@@ -109,7 +109,7 @@ impl Default for WindowsDnsResolver {
         Self {
             timeout: DEFAULT_TIMEOUT,
             limit: LookupLimit::new(Limits::UNBOUNDED),
-            in_flight: InFlight::new(Abandoned::Cancel),
+            in_flight: RecordFlights::new(Abandoned::Cancel),
         }
     }
 }
@@ -131,7 +131,7 @@ impl WindowsDnsResolver {
         /// lookups with this resolver.
         pub fn timeout(mut self, timeout: Duration) -> Self {
             self.timeout = timeout;
-            self.in_flight = InFlight::new(Abandoned::Cancel);
+            self.in_flight = RecordFlights::new(Abandoned::Cancel);
             self
         }
     }
@@ -192,7 +192,7 @@ impl WindowsDnsResolver {
         lookup: impl FnOnce(Domain, Instant, Duration) -> S + Send + 'static,
     ) -> impl Stream<Item = Result<T, BoxError>> + Send + '_
     where
-        T: Clone + Send + Sync + 'static,
+        T: SharedRecord,
         S: Stream<Item = Result<T, BoxError>> + Send + 'static,
     {
         if let Some(err) = leading_dot_refusal(&domain) {
@@ -202,7 +202,7 @@ impl WindowsDnsResolver {
         // the name goes out without its root dot: `x` and `x.` are one query
         let key = (domain.clone(), rrtype);
         Either::Right(coalesced_stream(
-            self.in_flight.clone(),
+            self.in_flight.for_record::<T>().clone(),
             key,
             timeout,
             move || {
@@ -2026,7 +2026,7 @@ mod tests {
             )
             .collect::<Vec<_>>();
         let both_running = async {
-            let running = resolver.in_flight.running();
+            let running = resolver.in_flight.for_record::<Ipv4Addr>().running();
             gate.notify_waiters();
             running
         };
@@ -2049,9 +2049,15 @@ mod tests {
     fn abandoned_lookups_are_cancelled() {
         // each holds a DNS Client service request nobody waits on anymore
         let resolver = WindowsDnsResolver::new();
-        assert_eq!(resolver.in_flight.abandoned(), Abandoned::Cancel);
+        assert_eq!(
+            resolver.in_flight.for_record::<Ipv4Addr>().abandoned(),
+            Abandoned::Cancel
+        );
         let resolver = resolver.with_timeout(Duration::from_secs(1));
-        assert_eq!(resolver.in_flight.abandoned(), Abandoned::Cancel);
+        assert_eq!(
+            resolver.in_flight.for_record::<Ipv4Addr>().abandoned(),
+            Abandoned::Cancel
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2177,7 +2183,7 @@ mod tests {
             )
             .collect::<Vec<_>>();
         let open = async {
-            let running = resolver.in_flight.running();
+            let running = resolver.in_flight.for_record::<Ipv4Addr>().running();
             gate.notify_waiters();
             running
         };
@@ -2197,7 +2203,7 @@ mod tests {
         let fake = Arc::new(FakeDnsBackend::new());
         let backend = fake.clone();
         let stream = coalesced_stream(
-            InFlight::new(Abandoned::Cancel),
+            crate::client::in_flight::InFlight::new(Abandoned::Cancel),
             (Domain::example(), ffi::DNS_TYPE_A),
             Duration::from_secs(30),
             move || {

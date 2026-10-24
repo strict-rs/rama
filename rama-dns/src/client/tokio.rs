@@ -1,22 +1,19 @@
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs as _},
+    sync::Arc,
     time::Duration,
 };
 
 use rama_core::{
-    error::{BoxError, ErrorExt as _},
     futures::{Stream, StreamExt as _, async_stream::stream_fn, future::Either, stream},
     telemetry::tracing,
 };
 use rama_net::address::Domain;
-use rama_utils::{
-    macros::{error::static_str_error, generate_set_and_with},
-    str::arcstr::ArcStr,
-};
+use rama_utils::macros::{error::static_str_error, generate_set_and_with};
 
 use super::{
-    in_flight::{InFlight, coalesced_stream, leading_dot_refusal},
+    in_flight::{InFlight, LookupTaskError},
     limit::{DnsTimeoutError, Limits, LookupLimit, deadline_after},
     resolver::{
         DnsAddressResolver, DnsCnameResolver, DnsResolver, DnsServiceBindingResolver,
@@ -39,7 +36,7 @@ pub struct TokioDnsResolver {
     timeout: Duration,
     limit: LookupLimit,
     // rooted flag: `Domain` equality ignores the trailing dot getaddrinfo honours
-    in_flight: InFlight<(Domain, bool)>,
+    in_flight: InFlight<(Domain, bool), Result<Vec<IpAddr>, TokioDnsResolverError>>,
 }
 
 /// Each call asks for A and AAAA at once.
@@ -133,23 +130,41 @@ impl TokioDnsResolver {
     fn lookup_addresses(
         &self,
         domain: Domain,
-    ) -> impl Stream<Item = Result<IpAddr, BoxError>> + Send {
-        if let Some(err) = leading_dot_refusal(&domain) {
-            return Either::Left(stream::once(std::future::ready(Err(err))));
+    ) -> impl Stream<Item = Result<IpAddr, TokioDnsResolverError>> + Send {
+        if domain.strip_leading_dot().is_some() {
+            return Either::Left(stream::once(std::future::ready(Err(
+                TokioDnsResolverError::InvalidName { domain },
+            ))));
         }
         let (timeout, limit) = (self.timeout, self.limit.clone());
         let key = (domain.clone(), domain.is_fqdn());
-        Either::Right(coalesced_stream(
-            self.in_flight.clone(),
-            key,
-            timeout,
-            move || lookup_host_stream(domain, timeout, limit),
-        ))
+        let in_flight = self.in_flight.clone();
+        Either::Right(stream_fn(async move |mut yielder| {
+            let queried = domain.clone();
+            match in_flight
+                .run(key, timeout, move || lookup_host(queried, timeout, limit))
+                .await
+            {
+                Ok(outcome) => match outcome.as_ref() {
+                    Ok(addresses) => {
+                        for address in addresses {
+                            yielder.yield_item(Ok(*address)).await;
+                        }
+                    }
+                    Err(error) => yielder.yield_item(Err(error.clone())).await,
+                },
+                Err(cause) => {
+                    yielder
+                        .yield_item(Err(TokioDnsResolverError::Shared { domain, cause }))
+                        .await
+                }
+            }
+        }))
     }
 }
 
 impl DnsAddressResolver for TokioDnsResolver {
-    type Error = BoxError;
+    type Error = TokioDnsResolverError;
 
     fn lookup_ipv4(
         &self,
@@ -224,70 +239,101 @@ impl DnsServiceBindingResolver for TokioDnsResolver {
 
 impl DnsResolver for TokioDnsResolver {}
 
-fn lookup_host_stream(
+async fn lookup_host(
     domain: Domain,
     timeout: Duration,
     limit: LookupLimit,
-) -> impl Stream<Item = Result<IpAddr, BoxError>> + Send {
-    stream_fn(async move |mut yielder| {
-        tracing::debug!(?timeout, %domain, "dns::tokio: getaddrinfo");
-
-        let deadline = deadline_after(timeout);
-        let task = limit.spawn_blocking(deadline, move |budget| {
-            // `None`: the caller already gave up
-            (!budget.is_zero()).then(|| {
-                (domain.as_str(), 0)
-                    .to_socket_addrs()
-                    .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
-            })
-        });
-        let lookup = async move { tokio::time::timeout_at(deadline, task.await?).await.ok() };
-
-        match lookup.await {
-            Some(Ok(Some(Ok(addrs)))) => {
-                for addr in addrs {
-                    yielder.yield_item(Ok(addr)).await;
-                }
-            }
-            Some(Ok(Some(Err(err)))) => {
-                yielder
-                    .yield_item(Err(TokioDnsResolverError::message(format!(
-                        "tokio dns getaddrinfo failed: {err}"
-                    ))
-                    .into()))
-                    .await;
-            }
-            Some(Err(err)) => {
-                yielder
-                    .yield_item(Err(err.context("tokio dns lookup task failed")))
-                    .await;
-            }
-            Some(Ok(None)) | None => {
-                tracing::debug!(?timeout, "dns::tokio: lookup timed out");
-                yielder
-                    .yield_item(Err(DnsTimeoutError::new(timeout).into()))
-                    .await;
-            }
-        }
+) -> Result<Vec<IpAddr>, TokioDnsResolverError> {
+    lookup_with(domain, timeout, limit, |queried| {
+        (queried.as_str(), 0)
+            .to_socket_addrs()
+            .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>())
     })
+    .await
 }
 
-#[derive(Debug)]
-struct TokioDnsResolverError(ArcStr);
-
-impl TokioDnsResolverError {
-    fn message(message: impl Into<ArcStr>) -> Self {
-        Self(message.into())
+async fn lookup_with<F>(
+    domain: Domain,
+    timeout: Duration,
+    limit: LookupLimit,
+    lookup: F,
+) -> Result<Vec<IpAddr>, TokioDnsResolverError>
+where
+    F: FnOnce(&Domain) -> std::io::Result<Vec<IpAddr>> + Send + 'static,
+{
+    tracing::debug!(?timeout, %domain, "dns::tokio: getaddrinfo");
+    let deadline = deadline_after(timeout);
+    let queried = domain.clone();
+    let task = limit.spawn_blocking(deadline, move |budget| {
+        (!budget.is_zero()).then(|| lookup(&queried))
+    });
+    let lookup = async move { tokio::time::timeout_at(deadline, task.await?).await.ok() };
+    match lookup.await {
+        Some(Ok(Some(Ok(addresses)))) => Ok(addresses),
+        Some(Ok(Some(Err(cause)))) => Err(TokioDnsResolverError::Lookup {
+            domain,
+            cause: Arc::new(cause),
+        }),
+        Some(Err(cause)) => Err(TokioDnsResolverError::Task {
+            domain,
+            cause: Arc::new(cause),
+        }),
+        Some(Ok(None)) | None => Err(TokioDnsResolverError::Timeout {
+            domain,
+            cause: DnsTimeoutError::new(timeout),
+        }),
     }
+}
+
+/// Native resolver failures shared by callers of the same lookup.
+#[derive(Debug, Clone)]
+pub enum TokioDnsResolverError {
+    InvalidName {
+        domain: Domain,
+    },
+    Lookup {
+        domain: Domain,
+        cause: Arc<std::io::Error>,
+    },
+    Task {
+        domain: Domain,
+        cause: Arc<tokio::task::JoinError>,
+    },
+    Timeout {
+        domain: Domain,
+        cause: DnsTimeoutError,
+    },
+    Shared {
+        domain: Domain,
+        cause: LookupTaskError,
+    },
 }
 
 impl fmt::Display for TokioDnsResolverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::InvalidName { domain } => write!(f, "dns query name starts with a dot: {domain}"),
+            Self::Lookup { domain, cause } => write!(f, "getaddrinfo for {domain} failed: {cause}"),
+            Self::Task { domain, cause } => write!(f, "lookup task for {domain} failed: {cause}"),
+            Self::Timeout { domain, cause } => write!(f, "lookup for {domain} stopped: {cause}"),
+            Self::Shared { domain, cause } => {
+                write!(f, "shared lookup for {domain} stopped: {cause}")
+            }
+        }
     }
 }
 
-impl std::error::Error for TokioDnsResolverError {}
+impl std::error::Error for TokioDnsResolverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidName { .. } => None,
+            Self::Lookup { cause, .. } => Some(cause.as_ref()),
+            Self::Task { cause, .. } => Some(cause.as_ref()),
+            Self::Timeout { cause, .. } => Some(cause),
+            Self::Shared { cause, .. } => Some(cause),
+        }
+    }
+}
 
 static_str_error! {
     #[doc = "Tokio DNS resolver does not support TXT lookups"]
@@ -311,6 +357,60 @@ mod tests {
 
     use super::*;
     use crate::client::in_flight::Abandoned;
+
+    #[derive(Debug)]
+    struct LookupObservation {
+        starts: usize,
+        results: Vec<Result<Arc<Result<Vec<IpAddr>, TokioDnsResolverError>>, LookupTaskError>>,
+    }
+
+    #[tokio::test]
+    async fn shared_native_failure_keeps_domain_and_io_cause() -> Result<(), LookupObservation> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let flights = InFlight::default();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let domain = Domain::example();
+        let callers = (0..3).map(|_| {
+            let starts = starts.clone();
+            let gate = gate.clone();
+            let queried = domain.clone();
+            flights.run(domain.clone(), DEFAULT_TIMEOUT, move || async move {
+                gate.notified().await;
+                lookup_with(
+                    queried,
+                    DEFAULT_TIMEOUT,
+                    LookupLimit::new(LIMITS),
+                    move |_| {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                    },
+                )
+                .await
+            })
+        });
+        let release = async {
+            tokio::task::yield_now().await;
+            gate.notify_waiters();
+        };
+        let (results, ()) = tokio::join!(join_all(callers), release);
+        let observed = LookupObservation {
+            starts: starts.load(Ordering::SeqCst),
+            results,
+        };
+        let Some(Ok(shared)) = observed.results.first() else {
+            return Err(observed);
+        };
+        let preserved = observed.starts == 1
+            && observed.results.len() == 3
+            && matches!(shared.as_ref(), Err(TokioDnsResolverError::Lookup { domain: queried, cause })
+                if queried == &domain && cause.kind() == std::io::ErrorKind::ConnectionRefused)
+            && observed.results.iter().all(|result| match result {
+                Ok(value) => Arc::ptr_eq(value, shared),
+                Err(_) => false,
+            });
+        preserved.then_some(()).ok_or(observed)
+    }
 
     #[test]
     fn abandoned_lookups_finish() {
@@ -384,7 +484,7 @@ mod tests {
         assert!(bare.iter().any(Result::is_ok), "{bare:?}");
         assert_matches!(
             dotted.as_slice(),
-            [Err(err)] if err.to_string().contains("starts with a dot"),
+            [Err(TokioDnsResolverError::InvalidName { domain })] if domain.as_str() == ".localhost",
             "{dotted:?}",
         );
     }
@@ -454,7 +554,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_matches!(
             items.as_slice(),
-            [Err(err)] if error_chain(err.as_ref()).any(|cause| cause.is::<DnsTimeoutError>()),
+            [Err(err)] if error_chain(err).any(|cause| cause.is::<DnsTimeoutError>()),
         );
 
         drop(release);

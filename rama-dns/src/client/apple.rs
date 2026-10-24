@@ -52,7 +52,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::time::Instant;
 
 use super::{
-    in_flight::{Abandoned, InFlight, coalesced_stream, leading_dot_refusal},
+    in_flight::{Abandoned, RecordFlights, SharedRecord, coalesced_stream, leading_dot_refusal},
     limit::{DnsTimeoutError, Limits, LookupLimit, deadline_after},
     resolver::{
         DnsAddressResolver, DnsCnameResolver, DnsResolver, DnsServiceBindingResolver,
@@ -72,7 +72,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct AppleDnsResolver {
     timeout: Duration,
     limit: LookupLimit,
-    in_flight: InFlight<(Domain, u16)>,
+    in_flight: RecordFlights<(Domain, u16)>,
 }
 
 impl Default for AppleDnsResolver {
@@ -80,7 +80,7 @@ impl Default for AppleDnsResolver {
         Self {
             timeout: DEFAULT_TIMEOUT,
             limit: LookupLimit::new(Limits::ONE_QUERY.with_apple_descriptors()),
-            in_flight: InFlight::new(Abandoned::Cancel),
+            in_flight: RecordFlights::new(Abandoned::Cancel),
         }
     }
 }
@@ -102,7 +102,7 @@ impl AppleDnsResolver {
         /// lookups with this resolver.
         pub fn timeout(mut self, timeout: Duration) -> Self {
             self.timeout = timeout;
-            self.in_flight = InFlight::new(Abandoned::Cancel);
+            self.in_flight = RecordFlights::new(Abandoned::Cancel);
             self
         }
     }
@@ -161,7 +161,7 @@ impl AppleDnsResolver {
         parser: P,
     ) -> impl Stream<Item = Result<T, BoxError>> + Send + '_
     where
-        T: fmt::Debug + Clone + Send + Sync + 'static,
+        T: fmt::Debug + SharedRecord,
         P: Fn(&[u8], &mut dyn FnMut(T)) -> Result<(), BoxError> + Send + Sync + 'static,
     {
         if let Some(err) = leading_dot_refusal(&domain) {
@@ -178,7 +178,7 @@ impl AppleDnsResolver {
         // the name goes out without its root dot: `x` and `x.` are one query
         let key = (domain.clone(), rrtype);
         Either::Right(coalesced_stream(
-            self.in_flight.clone(),
+            self.in_flight.for_record::<T>().clone(),
             key,
             timeout,
             move || limited_query_stream(domain, timeout, limit, rrtype, parser),
@@ -1085,7 +1085,7 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         // both lookups have joined by the time this is first polled
-        let running = async { resolver.in_flight.running() };
+        let running = async { resolver.in_flight.for_record::<Ipv4Addr>().running() };
         let (_, running) = tokio::join!(join_all(lookups), running);
         assert_eq!(running, 1);
     }
@@ -1132,9 +1132,15 @@ mod tests {
     fn abandoned_lookups_are_cancelled() {
         // each holds an mDNSResponder connection nobody waits on anymore
         let resolver = AppleDnsResolver::new();
-        assert_eq!(resolver.in_flight.abandoned(), Abandoned::Cancel);
+        assert_eq!(
+            resolver.in_flight.for_record::<Ipv4Addr>().abandoned(),
+            Abandoned::Cancel
+        );
         let resolver = resolver.with_timeout(Duration::from_secs(1));
-        assert_eq!(resolver.in_flight.abandoned(), Abandoned::Cancel);
+        assert_eq!(
+            resolver.in_flight.for_record::<Ipv4Addr>().abandoned(),
+            Abandoned::Cancel
+        );
     }
 
     #[test]

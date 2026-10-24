@@ -1,25 +1,22 @@
 use std::{
-    any::{Any, TypeId},
     fmt,
     hash::Hash,
-    mem::take,
     num::NonZero,
     panic::{AssertUnwindSafe, catch_unwind},
-    pin::{Pin, pin},
+    pin::Pin,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Waker, ready},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
 use ahash::{HashMap, RandomState};
 use parking_lot::Mutex;
-use pin_project_lite::pin_project;
 use rama_core::{
     error::{ArcError, BoxError, BoxErrorExt as _},
-    futures::{Stream, StreamExt as _, async_stream::stream_fn},
+    futures::{Stream, async_stream::stream_fn},
     rt,
     telemetry::tracing::{self, Instrument as _},
 };
@@ -33,20 +30,52 @@ use tokio::{
 
 use super::limit::DnsTimeoutError;
 
-/// A run lives on the runtime that started it, which only that runtime's
-/// callers can count on to drive it.
-type Slot<K> = (K, TypeId, Option<runtime::Id>);
-type Map<K> = HashMap<Slot<K>, Arc<dyn Any + Send + Sync>>;
-type Flights<K> = Arc<Shards<K>>;
+// Native host lookups share a complete result; the streaming platform providers
+// additionally buffer and replay records produced before their terminal error.
+#[cfg(any(target_vendor = "apple", target_os = "windows", test))]
+mod coalesced;
+#[cfg(any(target_vendor = "apple", target_os = "windows", test))]
+pub(crate) use coalesced::coalesced_stream;
 
-/// The runs by key, spread over locks so unrelated keys rarely contend.
-struct Shards<K> {
-    hasher: RandomState,
-    /// A power of two: contention comes from threads, not from keys.
-    maps: Box<[Mutex<Map<K>>]>,
+/// Failure to obtain the terminal result of a shared resolver task.
+#[derive(Debug, Clone)]
+pub enum LookupTaskError {
+    TimedOut(DnsTimeoutError),
+    NoAnswer,
 }
 
-impl<K> Shards<K> {
+impl fmt::Display for LookupTaskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut(cause) => cause.fmt(f),
+            Self::NoAnswer => f.write_str("dns lookup ended without an answer"),
+        }
+    }
+}
+
+impl std::error::Error for LookupTaskError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TimedOut(cause) => Some(cause),
+            Self::NoAnswer => None,
+        }
+    }
+}
+
+/// A run lives on the runtime that started it, which only that runtime's
+/// callers can count on to drive it.
+type Slot<K> = (K, Option<runtime::Id>);
+type Map<K, V> = HashMap<Slot<K>, Arc<Flight<V>>>;
+type Flights<K, V> = Arc<Shards<K, V>>;
+
+/// The runs by key, spread over locks so unrelated keys rarely contend.
+struct Shards<K, V> {
+    hasher: RandomState,
+    /// A power of two: contention comes from threads, not from keys.
+    maps: Box<[Mutex<Map<K, V>>]>,
+}
+
+impl<K, V> Shards<K, V> {
     fn new() -> Self {
         let threads = std::thread::available_parallelism().map_or(4, NonZero::get);
         let shards = (threads * 4).next_power_of_two().clamp(8, 1024);
@@ -61,7 +90,7 @@ impl<K> Shards<K> {
     }
 }
 
-impl<K: Hash> Shards<K> {
+impl<K: Hash, V> Shards<K, V> {
     fn shard(&self, slot: &Slot<K>) -> usize {
         // the mask keeps it below the shard count, so the cast cannot truncate
         (self.hasher.hash_one(slot) & (self.maps.len() as u64 - 1)) as usize
@@ -83,18 +112,18 @@ pub(crate) enum Abandoned {
 ///
 /// The run is its own task, so no single caller's cancellation cancels it.
 /// Nothing is kept once it is done.
-pub(crate) struct InFlight<K> {
-    flights: Flights<K>,
+pub(crate) struct InFlight<K, V> {
+    flights: Flights<K, V>,
     abandoned: Abandoned,
 }
 
-impl<K> Default for InFlight<K> {
+impl<K, V> Default for InFlight<K, V> {
     fn default() -> Self {
         Self::new(Abandoned::default())
     }
 }
 
-impl<K> Clone for InFlight<K> {
+impl<K, V> Clone for InFlight<K, V> {
     fn clone(&self) -> Self {
         Self {
             flights: self.flights.clone(),
@@ -103,7 +132,7 @@ impl<K> Clone for InFlight<K> {
     }
 }
 
-impl<K> fmt::Debug for InFlight<K> {
+impl<K, V> fmt::Debug for InFlight<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InFlight")
             .field("running", &self.flights.len())
@@ -112,7 +141,7 @@ impl<K> fmt::Debug for InFlight<K> {
 }
 
 #[cfg(test)]
-impl<K> InFlight<K> {
+impl<K, V> InFlight<K, V> {
     /// Keys with a run in progress.
     pub(crate) fn running(&self) -> usize {
         self.flights.len()
@@ -135,9 +164,72 @@ impl<K> InFlight<K> {
     }
 }
 
+/// Each record family owns a statically typed set of shared lookups.
+#[derive(Clone, Debug)]
+pub(crate) struct RecordFlights<K> {
+    ipv4: InFlight<K, Outcome<std::net::Ipv4Addr>>,
+    ipv6: InFlight<K, Outcome<std::net::Ipv6Addr>>,
+    cname: InFlight<K, Outcome<crate::wire::Name>>,
+    txt: InFlight<K, Outcome<crate::wire::Txt>>,
+    service: InFlight<K, Outcome<crate::wire::ServiceBinding>>,
+}
+
+impl<K> Default for RecordFlights<K> {
+    fn default() -> Self {
+        Self::new(Abandoned::Finish)
+    }
+}
+
+impl<K> RecordFlights<K> {
+    pub(crate) fn new(abandoned: Abandoned) -> Self {
+        Self {
+            ipv4: InFlight::new(abandoned),
+            ipv6: InFlight::new(abandoned),
+            cname: InFlight::new(abandoned),
+            txt: InFlight::new(abandoned),
+            service: InFlight::new(abandoned),
+        }
+    }
+
+    pub(crate) fn for_record<T: SharedRecord>(&self) -> &InFlight<K, Outcome<T>> {
+        T::flights(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_with(&self, other: &Self) -> bool {
+        self.ipv4.shares_with(&other.ipv4)
+            && self.ipv6.shares_with(&other.ipv6)
+            && self.cname.shares_with(&other.cname)
+            && self.txt.shares_with(&other.txt)
+            && self.service.shares_with(&other.service)
+    }
+}
+
+pub(crate) trait SharedRecord: Clone + Send + Sync + 'static {
+    fn flights<K>(owner: &RecordFlights<K>) -> &InFlight<K, Outcome<Self>>;
+}
+
+macro_rules! shared_records {
+    ($($ty:ty => $field:ident),+ $(,)?) => {
+        $(impl SharedRecord for $ty {
+            fn flights<K>(owner: &RecordFlights<K>) -> &InFlight<K, Outcome<Self>> {
+                &owner.$field
+            }
+        })+
+    };
+}
+
+shared_records! {
+    std::net::Ipv4Addr => ipv4,
+    std::net::Ipv6Addr => ipv6,
+    crate::wire::Name => cname,
+    crate::wire::Txt => txt,
+    crate::wire::ServiceBinding => service,
+}
+
 /// One run and everyone waiting on it, in a single allocation.
 struct Flight<V> {
-    answer: OnceLock<Result<Arc<V>, ArcError>>,
+    answer: OnceLock<Result<Arc<V>, LookupTaskError>>,
     /// Callers waiting for the answer; `None` once the run ended, with or
     /// without one.
     wakers: Mutex<Option<Wakers>>,
@@ -164,7 +256,7 @@ impl<V> Flight<V> {
         }
     }
 
-    fn end(&self, answer: Option<Result<Arc<V>, ArcError>>) {
+    fn end(&self, answer: Option<Result<Arc<V>, LookupTaskError>>) {
         if let Some(answer) = answer {
             _ = self.answer.set(answer);
         }
@@ -210,7 +302,7 @@ struct Answer<'a, V> {
 }
 
 impl<V> Future for Answer<'_, V> {
-    type Output = Option<Result<Arc<V>, ArcError>>;
+    type Output = Option<Result<Arc<V>, LookupTaskError>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let flight = self.flight;
@@ -265,7 +357,7 @@ enum Joined<V> {
     Started(Waiting<V>),
 }
 
-impl<K> InFlight<K> {
+impl<K, V> InFlight<K, V> {
     pub(crate) fn new(abandoned: Abandoned) -> Self {
         Self {
             flights: Arc::new(Shards::new()),
@@ -274,30 +366,30 @@ impl<K> InFlight<K> {
     }
 }
 
-impl<K: Hash + Eq + Clone + Send + Sync + 'static> InFlight<K> {
+impl<K: Hash + Eq + Clone + Send + Sync + 'static, V: Send + Sync + 'static> InFlight<K, V> {
     /// Join the run for `key`, or start one with `lookup`.
     ///
     /// `max_duration` is the longest the lookup may legitimately take: a
     /// caller waits at most a quarter longer, and a run is abandoned after
     /// three times it, a safety net for a backend ignoring its own deadline.
-    pub(crate) async fn run<V, F>(
+    pub(crate) async fn run<F>(
         &self,
         key: K,
         max_duration: Duration,
         lookup: impl FnOnce() -> F,
-    ) -> Result<Arc<V>, ArcError>
+    ) -> Result<Arc<V>, LookupTaskError>
     where
         V: Send + Sync + 'static,
         F: Future<Output = V> + Send + 'static,
     {
         let runtime = Handle::try_current().ok().map(|runtime| runtime.id());
-        let slot = (key, TypeId::of::<V>(), runtime);
+        let slot = (key, runtime);
         let shard = self.flights.shard(&slot);
         let wait = max_duration.saturating_add(max_duration / 4);
         let shared = async {
             let mut lookup = Some(lookup);
             loop {
-                match self.join::<V>(&slot, shard) {
+                match self.join(&slot, shard) {
                     Joined::Running(waiting) => {
                         if let Some(answer) = waiting.flight.answer().await {
                             return answer;
@@ -307,26 +399,28 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> InFlight<K> {
                     }
                     Joined::Started(waiting) => {
                         let Some(lookup) = lookup.take() else {
-                            return Err(ArcError::from_static_str(
-                                "dns lookup ended without an answer",
-                            ));
+                            return Err(LookupTaskError::NoAnswer);
                         };
                         self.start(slot, shard, max_duration, &waiting.flight, lookup);
-                        return waiting.flight.answer().await.unwrap_or_else(|| {
-                            Err(ArcError::from_static_str(
-                                "dns lookup ended without an answer",
-                            ))
-                        });
+                        return waiting
+                            .flight
+                            .answer()
+                            .await
+                            .unwrap_or_else(|| Err(LookupTaskError::NoAnswer));
                     }
                 }
             }
         };
         tokio::time::timeout(wait, shared)
             .await
-            .unwrap_or_else(|_elapsed| Err(ArcError::new(DnsTimeoutError::new(max_duration))))
+            .unwrap_or_else(|_elapsed| {
+                Err(LookupTaskError::TimedOut(DnsTimeoutError::new(
+                    max_duration,
+                )))
+            })
     }
 
-    fn join<V: Send + Sync + 'static>(&self, slot: &Slot<K>, shard: usize) -> Joined<V> {
+    fn join(&self, slot: &Slot<K>, shard: usize) -> Joined<V> {
         let map = &self.flights.maps[shard];
         if let Some(waiting) = self.join_running(&map.lock(), slot) {
             return Joined::Running(waiting);
@@ -341,25 +435,21 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> InFlight<K> {
         Joined::Started(self.waiting(flight))
     }
 
-    fn join_running<V: Send + Sync + 'static>(
-        &self,
-        flights: &Map<K>,
-        slot: &Slot<K>,
-    ) -> Option<Waiting<V>> {
-        let flight = flights.get(slot)?.clone().downcast::<Flight<V>>().ok()?;
+    fn join_running(&self, flights: &Map<K, V>, slot: &Slot<K>) -> Option<Waiting<V>> {
+        let flight = flights.get(slot)?.clone();
         // counted under the lock, so a leaving waiter never misses us
         flight.waiters.fetch_add(1, Ordering::AcqRel);
         Some(self.waiting(flight))
     }
 
-    fn waiting<V>(&self, flight: Arc<Flight<V>>) -> Waiting<V> {
+    fn waiting(&self, flight: Arc<Flight<V>>) -> Waiting<V> {
         Waiting {
             flight,
             abandoned: self.abandoned,
         }
     }
 
-    fn start<V, F>(
+    fn start<F>(
         &self,
         slot: Slot<K>,
         shard: usize,
@@ -399,27 +489,30 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> InFlight<K> {
     }
 }
 
-fn answer_of<V>(answer: Result<V, Elapsed>, max_duration: Duration) -> Result<Arc<V>, ArcError> {
+fn answer_of<V>(
+    answer: Result<V, Elapsed>,
+    max_duration: Duration,
+) -> Result<Arc<V>, LookupTaskError> {
     answer.map(Arc::new).map_err(|_elapsed| {
         tracing::debug!(
             ?max_duration,
             "dns lookup abandoned: backend ignored its deadline"
         );
-        ArcError::new(DnsTimeoutError::new(max_duration))
+        LookupTaskError::TimedOut(DnsTimeoutError::new(max_duration))
     })
 }
 
 /// Frees the key when its run ends, however it ends, before its callers
 /// learn the outcome.
 struct Release<K: Hash + Eq, V> {
-    flights: Flights<K>,
+    flights: Flights<K, V>,
     slot: Slot<K>,
     shard: usize,
     flight: Option<Arc<Flight<V>>>,
 }
 
 impl<K: Hash + Eq, V> Release<K, V> {
-    fn finish(mut self, answer: Result<Arc<V>, ArcError>) {
+    fn finish(mut self, answer: Result<Arc<V>, LookupTaskError>) {
         let flight = self.flight.take();
         drop(self);
         if let Some(flight) = flight {
@@ -461,50 +554,11 @@ impl<T> Outcome<T> {
             error: error.map(ArcError::from_box_error),
         }
     }
-
-    /// Drain `stream` up to and including its first error.
-    pub(crate) fn collect<S>(stream: S) -> Collect<S, T>
-    where
-        S: Stream<Item = Result<T, BoxError>>,
-    {
-        Collect {
-            stream,
-            records: Vec::new(),
-        }
-    }
-}
-
-pin_project! {
-    /// The future of [`Outcome::collect`]: it stores its stream once, where
-    /// an `async fn` would hold it twice.
-    pub(crate) struct Collect<S, T> {
-        #[pin]
-        stream: S,
-        records: Vec<T>,
-    }
-}
-
-impl<S, T> Future for Collect<S, T>
-where
-    S: Stream<Item = Result<T, BoxError>>,
-{
-    type Output = Outcome<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
-        loop {
-            match ready!(this.stream.as_mut().poll_next(cx)) {
-                Some(Ok(record)) => this.records.push(record),
-                Some(Err(err)) => return Poll::Ready(Outcome::new(take(this.records), Some(err))),
-                None => return Poll::Ready(Outcome::new(take(this.records), None)),
-            }
-        }
-    }
 }
 
 /// Replay a shared outcome to one caller.
 pub(crate) fn outcome_stream<T>(
-    outcome: Result<Arc<Outcome<T>>, ArcError>,
+    outcome: Result<Arc<Outcome<T>>, LookupTaskError>,
 ) -> impl Stream<Item = Result<T, BoxError>> + Send
 where
     T: Clone + Send + Sync + 'static,
@@ -518,7 +572,8 @@ where
                 yielder.yield_item(Err(replay(err))).await;
             }
         }
-        Err(err) => yielder.yield_item(Err(replay(&err))).await,
+        Err(LookupTaskError::TimedOut(error)) => yielder.yield_item(Err(error.into())).await,
+        Err(error) => yielder.yield_item(Err(error.into())).await,
     })
 }
 
@@ -540,37 +595,13 @@ pub(crate) fn leading_dot_refusal(domain: &Domain) -> Option<BoxError> {
         .then(|| BoxError::from_static_str("dns query name starts with a dot"))
 }
 
-/// Run a streaming `lookup` once for all concurrent callers of `key`.
-pub(crate) fn coalesced_stream<K, T, S>(
-    in_flight: InFlight<K>,
-    key: K,
-    timeout: Duration,
-    lookup: impl FnOnce() -> S + Send + 'static,
-) -> impl Stream<Item = Result<T, BoxError>> + Send
-where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    T: Clone + Send + Sync + 'static,
-    S: Stream<Item = Result<T, BoxError>> + Send + 'static,
-{
-    // one stream, so waiting for the run and replaying it share their state
-    stream_fn(async move |mut yielder| {
-        let outcome = in_flight
-            .run(key, timeout, move || Outcome::collect(lookup()))
-            .await;
-        let mut items = pin!(outcome_stream(outcome));
-        while let Some(item) = items.next().await {
-            yielder.yield_item(item).await;
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{assert_matches, pin::pin};
 
     use super::*;
-    use rama_core::futures::{FutureExt as _, future::join_all, stream};
+    use rama_core::futures::{FutureExt as _, StreamExt as _, future::join_all, stream};
     use tokio::sync::Notify;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -617,6 +648,7 @@ mod tests {
     #[tokio::test]
     async fn keys_and_value_types_do_not_share() {
         let in_flight = InFlight::default();
+        let other_type = InFlight::default();
         let starts = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
 
@@ -624,7 +656,7 @@ mod tests {
             tokio::join!(
                 in_flight.run("a", TIMEOUT, || gated(&starts, &gate, 1)),
                 in_flight.run("b", TIMEOUT, || gated(&starts, &gate, 2)),
-                in_flight.run("a", TIMEOUT, || {
+                other_type.run("a", TIMEOUT, || {
                     starts.fetch_add(1, Ordering::SeqCst);
                     async { "other type" }
                 }),
@@ -704,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn callers_that_leave_free_their_waker_slots() {
-        let in_flight = InFlight::<&str>::default();
+        let in_flight = InFlight::<&str, _>::default();
         let mut staying = pin!(in_flight.run("key", TIMEOUT, std::future::pending::<usize>));
         assert!(staying.as_mut().now_or_never().is_none());
 
@@ -716,9 +748,8 @@ mod tests {
 
         let flights = in_flight.flights.maps.iter().find_map(|map| {
             map.lock()
-                .get(&("key", TypeId::of::<usize>(), Some(Handle::current().id())))
+                .get(&("key", Some(Handle::current().id())))
                 .cloned()
-                .and_then(|flight| flight.downcast::<Flight<usize>>().ok())
         });
         let flight = flights.expect("the pending run");
         let slots = flight
@@ -889,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn panicking_run_fails_its_callers_and_frees_the_key() {
-        let in_flight = InFlight::<&str>::default();
+        let in_flight = InFlight::<&str, _>::default();
 
         let result = in_flight
             .run("key", TIMEOUT, || async { panic!("backend bug") })
@@ -901,7 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_panicking_after_its_first_poll_fails_its_callers() {
-        let in_flight = InFlight::<&str>::default();
+        let in_flight = InFlight::<&str, _>::default();
 
         let result = in_flight
             .run("key", TIMEOUT, || async {
@@ -916,7 +947,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn late_joiner_of_an_abandoned_run_sees_a_timeout() {
-        let in_flight = InFlight::<&str>::default();
+        let in_flight = InFlight::<&str, _>::default();
         let budget = Duration::from_secs(1);
 
         let first = in_flight.run("key", budget, std::future::pending::<usize>);
@@ -931,9 +962,10 @@ mod tests {
 
         for result in [first, late] {
             let err = result.expect_err("a stuck run fails its callers");
-            let timeout = err
-                .downcast_ref::<DnsTimeoutError>()
-                .map(DnsTimeoutError::timeout);
+            let timeout = match &err {
+                LookupTaskError::TimedOut(cause) => Some(cause.timeout()),
+                LookupTaskError::NoAnswer => None,
+            };
             assert_eq!(timeout, Some(budget), "{err}");
         }
     }
@@ -962,7 +994,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stuck_run_is_abandoned_after_its_bound() {
-        let in_flight = InFlight::<&str>::default();
+        let in_flight = InFlight::<&str, _>::default();
 
         let result = in_flight
             .run("key", Duration::from_secs(1), std::future::pending::<usize>)
@@ -981,7 +1013,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn joiner_waits_no_longer_than_its_own_bound() {
-        let in_flight = InFlight::<&str>::default();
+        let in_flight = InFlight::<&str, _>::default();
         let starts = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
 
@@ -1004,9 +1036,11 @@ mod tests {
 
         assert_eq!(*patient.unwrap(), 1);
         let err = hasty.expect_err("the hasty caller times out on its own");
-        let timeout = err
-            .downcast_ref::<DnsTimeoutError>()
-            .expect("a typed timeout");
+        let timeout = match &err {
+            LookupTaskError::TimedOut(cause) => Some(cause),
+            LookupTaskError::NoAnswer => None,
+        }
+        .expect("a typed timeout");
         assert_eq!(
             timeout.timeout(),
             Duration::from_millis(100),
@@ -1018,7 +1052,7 @@ mod tests {
 
     #[tokio::test]
     async fn panicking_lookup_constructor_frees_the_key() {
-        let in_flight = InFlight::<&str>::default();
+        let in_flight = InFlight::<&str, _>::default();
 
         let result = std::panic::AssertUnwindSafe(in_flight.run(
             "key",
@@ -1047,7 +1081,7 @@ mod tests {
             let handle = runtime.handle().clone();
             drop(runtime);
 
-            let in_flight = InFlight::<&str>::default();
+            let in_flight = InFlight::<&str, _>::default();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handle.block_on(in_flight.run("key", TIMEOUT, || std::future::ready(1_usize)))
             }));
@@ -1062,7 +1096,7 @@ mod tests {
 
     #[test]
     fn runs_are_shared_only_within_their_runtime() {
-        let in_flight = InFlight::<&str>::new(Abandoned::Finish);
+        let in_flight = InFlight::<&str, _>::new(Abandoned::Finish);
         let runtime = || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

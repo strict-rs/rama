@@ -1,10 +1,9 @@
 use std::{
-    marker::{PhantomData, Unpin},
+    marker::Unpin,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use rama_core::error::BoxError;
 use rama_core::extensions::ExtensionsRef;
 use rama_core::telemetry::tracing::{debug, error, trace};
 use rama_core::{
@@ -18,7 +17,7 @@ use std::task::ready;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{Http1Transaction, Wants};
-use crate::body::{Body, DecodedLength, Incoming as IncomingBody};
+use crate::body::{DecodedLength, Incoming as IncomingBody};
 use crate::client::dispatch::TrySendError;
 use crate::common::task;
 use crate::proto::{BodyLength, Conn, Dispatched, MessageHead, RequestHead};
@@ -26,7 +25,7 @@ use crate::proto::{BodyLength, Conn, Dispatched, MessageHead, RequestHead};
 pub(crate) struct Dispatcher<D, Bs: StreamingBody, I, T> {
     conn: Conn<I, Bs::Data, T>,
     dispatch: D,
-    body_tx: SenderDropGuard,
+    body_tx: SenderDropGuard<Bs::Error>,
     body_rx: Pin<Box<Option<Bs>>>,
     is_closing: bool,
     // Set once the dispatch loop has ended. After an error we still want to
@@ -36,7 +35,7 @@ pub(crate) struct Dispatcher<D, Bs: StreamingBody, I, T> {
     // An error that could not be handed to a user (e.g. server-side, where
     // there is no client callback) and must be surfaced once the best-effort
     // shutdown has been driven.
-    pending_err: Option<crate::Error>,
+    pending_err: Option<crate::Error<Bs::Error>>,
     // Shutdown completed or was abandoned after a write timeout; never retry it.
     shut_down: bool,
     linger: Linger,
@@ -76,7 +75,7 @@ fn after(instant: tokio::time::Instant, duration: std::time::Duration) -> tokio:
         .unwrap_or_else(|| instant + std::time::Duration::from_secs(86_400 * 365 * 30))
 }
 
-pub(crate) trait Dispatch {
+pub(crate) trait Dispatch<E> {
     type PollItem;
     type PollBody;
     type PollError;
@@ -85,8 +84,10 @@ pub(crate) trait Dispatch {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<(Self::PollItem, Self::PollBody), Self::PollError>>>;
-    fn recv_msg(&mut self, msg: crate::Result<(Self::RecvItem, IncomingBody)>)
-    -> crate::Result<()>;
+    fn recv_msg(
+        &mut self,
+        msg: crate::Result<(Self::RecvItem, IncomingBody<E>), E>,
+    ) -> crate::Result<(), E>;
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>>;
     fn should_poll(&self) -> bool;
     /// Stops taking messages, settling those still on their way in.
@@ -95,35 +96,46 @@ pub(crate) trait Dispatch {
 
 pub(crate) struct Server<S, B>
 where
-    S: Service<Request<B>, Output = Response, Error = Infallible>,
+    B: StreamingBody,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible>,
 {
-    in_flight: Option<Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send + 'static>>>,
+    in_flight:
+        Option<Pin<Box<dyn Future<Output = Result<Response<B>, Infallible>> + Send + 'static>>>,
     pub(crate) service: S,
-    _phantom: PhantomData<fn() -> B>,
 }
 
 pin_project_lite::pin_project! {
-    pub(crate) struct Client<B> {
-        callback: Option<crate::client::dispatch::Callback<Request<B>, Response<IncomingBody>>>,
+    pub(crate) struct Client<B>
+    where B: StreamingBody,
+    {
+        callback: Option<crate::client::dispatch::Callback<Request<B>, Response<IncomingBody<B::Error>>, B::Error>>,
         #[pin]
         rx: ClientRx<B>,
         rx_closed: bool,
     }
 }
 
-type ClientRx<B> = crate::client::dispatch::Receiver<Request<B>, Response<IncomingBody>>;
+type ClientRx<B> = crate::client::dispatch::Receiver<
+    Request<B>,
+    Response<IncomingBody<<B as StreamingBody>::Error>>,
+    <B as StreamingBody>::Error,
+>;
 
 impl<D, Bs, I, T> Dispatcher<D, Bs, I, T>
 where
     D: Dispatch<
+            Bs::Error,
             PollItem = MessageHead<T::Outgoing>,
             PollBody = Bs,
+            PollError = Infallible,
             RecvItem = MessageHead<T::Incoming>,
         > + Unpin,
-    D::PollError: Into<BoxError>,
     I: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
     T: Http1Transaction + Unpin,
-    Bs: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    Bs: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     pub(crate) fn new(dispatch: D, conn: Conn<I, Bs::Data, T>) -> Self {
         Self {
@@ -165,7 +177,7 @@ where
     pub(crate) fn poll_without_shutdown(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<crate::Result<()>> {
+    ) -> Poll<crate::Result<(), Bs::Error>> {
         Pin::new(self).poll_catch(cx, false).map_ok(|ds| {
             if let Dispatched::Upgrade(pending) = ds {
                 pending.manual();
@@ -177,7 +189,7 @@ where
         &mut self,
         cx: &mut Context<'_>,
         should_shutdown: bool,
-    ) -> Poll<crate::Result<Dispatched>> {
+    ) -> Poll<crate::Result<Dispatched, Bs::Error>> {
         // Phase 1: run the dispatch loop until it finishes or errors. On error
         // we switch into a best-effort shutdown phase rather than dropping the
         // transport mid-flight (which would skip TLS `close_notify`).
@@ -190,7 +202,7 @@ where
                     // Be sure to alert a streaming body of the failure with a
                     // more specific error than the drop guard would provide.
                     if let Some(mut body) = self.body_tx.take() {
-                        body.send_error(crate::Error::new_body("connection error"));
+                        body.send_error(e.clone());
                     }
                     // Only a rejected request leaves a response worth
                     // protecting while the client may still be sending: the
@@ -206,7 +218,8 @@ where
                     // the error back; either way we still drive a best-effort
                     // shutdown below before surfacing any residual error,
                     // rather than returning early as the old code did.
-                    self.pending_err = self.dispatch.recv_msg(Err(e)).err();
+                    let reported = self.dispatch.recv_msg(Err(e.clone())).err().unwrap_or(e);
+                    self.record_error(reported);
                 }
             }
             self.shutting_down = true;
@@ -222,9 +235,12 @@ where
         // intrinsically.
         if should_shutdown {
             if !self.shut_down {
-                // result ignored: the transport may already be broken, and
-                // `conn::poll_shutdown` logs any IO error itself.
-                _ = ready!(self.conn.poll_shutdown(cx));
+                if let Err(cause) = ready!(self.conn.poll_shutdown(cx)) {
+                    self.pending_err = Some(match self.pending_err.take() {
+                        Some(original) => original.with_finalization(cause),
+                        None => crate::Error::new_shutdown(cause),
+                    });
+                }
                 self.shut_down = true;
             }
             // Phase 3: lingering close, see `Linger`.
@@ -241,11 +257,18 @@ where
         }
     }
 
+    fn record_error(&mut self, error: crate::Error<Bs::Error>) {
+        self.pending_err = Some(match self.pending_err.take() {
+            Some(earlier) => error.preceded_by(earlier),
+            None => error,
+        });
+    }
+
     fn poll_inner(
         &mut self,
         cx: &mut Context<'_>,
         should_shutdown: bool,
-    ) -> Poll<crate::Result<Dispatched>> {
+    ) -> Poll<crate::Result<Dispatched, Bs::Error>> {
         T::update_date();
 
         // Once shut down, only lingering is left to do.
@@ -274,7 +297,9 @@ where
         if self.shut_down || self.is_done() {
             if !self.shut_down {
                 if let Some(pending) = self.conn.pending_upgrade() {
-                    self.conn.take_error()?;
+                    self.conn
+                        .take_error()
+                        .map_err(crate::Error::into_body_error)?;
                     return Poll::Ready(Ok(Dispatched::Upgrade(pending)));
                 } else if should_shutdown {
                     let shutdown = self.conn.poll_shutdown(cx);
@@ -289,14 +314,16 @@ where
             if should_shutdown {
                 ready!(self.poll_linger(cx));
             }
-            self.conn.take_error()?;
+            self.conn
+                .take_error()
+                .map_err(crate::Error::into_body_error)?;
             Poll::Ready(Ok(Dispatched::Shutdown))
         } else {
             Poll::Pending
         }
     }
 
-    fn linger_write_timeout(&mut self) -> Poll<crate::Result<Dispatched>> {
+    fn linger_write_timeout(&mut self) -> Poll<crate::Result<Dispatched, Bs::Error>> {
         // A best-effort shutdown would flush the same blocked response again.
         // The response is incomplete. Publish an abnormal end before dropping
         // IO: Apple FFI streams otherwise fire their orderly close callback,
@@ -405,7 +432,7 @@ where
         }
     }
 
-    fn poll_loop(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    fn poll_loop(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<(), Bs::Error>> {
         // Limit the looping on this connection, in case it is ready far too
         // often, so that other futures don't starve.
         //
@@ -467,7 +494,7 @@ where
         task::yield_now(cx).map(|never| match never {})
     }
 
-    fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<(), Bs::Error>> {
         loop {
             if self.is_closing {
                 return Poll::Ready(Ok(()));
@@ -533,19 +560,24 @@ where
                             return Poll::Pending;
                         }
                         Poll::Ready(Some(Err(e))) => {
-                            body.send_error(crate::Error::new_body(e));
+                            let error = crate::Error::new_body(e).into_body_error();
+                            body.send_error(error.clone());
+                            self.record_error(error);
                         }
                     }
                 } else {
                     // just drop, the body will close automatically
                 }
             } else {
-                return self.conn.poll_read_keep_alive(cx);
+                return self
+                    .conn
+                    .poll_read_keep_alive(cx)
+                    .map_err(crate::Error::into_body_error);
             }
         }
     }
 
-    fn poll_read_head(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    fn poll_read_head(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<(), Bs::Error>> {
         // can dispatch receive, or does it still care about other incoming message?
         if let Ok(()) = ready!(self.dispatch.poll_ready(cx)) {
         } else {
@@ -575,10 +607,10 @@ where
             }
             Some(Err(err)) => {
                 debug!("read_head error: {}", err);
-                self.dispatch.recv_msg(Err(err))?;
-                // if here, the dispatcher gave the user the error
-                // somewhere else. we still need to shutdown, but
-                // not as a second error.
+                let error = err.into_body_error();
+                self.dispatch.recv_msg(Err(error.clone()))?;
+                // Both observers retain the same native cause; a clean local shutdown does not erase it.
+                self.record_error(error);
                 self.close();
                 Poll::Ready(Ok(()))
             }
@@ -595,7 +627,7 @@ where
         }
     }
 
-    fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<(), Bs::Error>> {
         loop {
             if self.is_closing {
                 return Poll::Ready(Ok(()));
@@ -654,7 +686,9 @@ where
                                 *clear_body = true;
                                 if chunk.remaining() == 0 {
                                     trace!("discarding empty chunk");
-                                    self.conn.end_body()?;
+                                    self.conn
+                                        .end_body()
+                                        .map_err(crate::Error::into_body_error)?;
                                 } else {
                                     self.conn.write_body_and_end(chunk);
                                 }
@@ -675,12 +709,16 @@ where
                         }
                     } else {
                         *clear_body = true;
-                        self.conn.end_body()?;
+                        self.conn
+                            .end_body()
+                            .map_err(crate::Error::into_body_error)?;
                     }
                 } else {
                     // If there's no body_rx, end the body
                     if self.conn.can_write_body() {
-                        self.conn.end_body()?;
+                        self.conn
+                            .end_body()
+                            .map_err(crate::Error::into_body_error)?;
                     } else {
                         return Poll::Pending;
                     }
@@ -689,7 +727,7 @@ where
         }
     }
 
-    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<(), Bs::Error>> {
         self.conn.poll_flush(cx).map_err(|err| {
             debug!("error writing: {}", err);
             crate::Error::new_body_write(err)
@@ -730,16 +768,20 @@ where
 impl<D, Bs, I, T> Future for Dispatcher<D, Bs, I, T>
 where
     D: Dispatch<
+            Bs::Error,
             PollItem = MessageHead<T::Outgoing>,
             PollBody = Bs,
+            PollError = Infallible,
             RecvItem = MessageHead<T::Incoming>,
         > + Unpin,
-    D::PollError: Into<BoxError>,
     I: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
     T: Http1Transaction + Unpin,
-    Bs: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    Bs: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
-    type Output = crate::Result<Dispatched>;
+    type Output = crate::Result<Dispatched, Bs::Error>;
 
     #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -779,24 +821,24 @@ impl<T> Drop for OptGuard<'_, T> {
 /// connection is shut down) while it still owns a body `Sender`, the guard
 /// sends an incomplete-message error so the receiver sees an error instead
 /// of a silent, clean end-of-stream.
-struct SenderDropGuard(Option<crate::body::Sender>);
+struct SenderDropGuard<E>(Option<crate::body::Sender<E>>);
 
-impl SenderDropGuard {
+impl<E> SenderDropGuard<E> {
     #[inline(always)]
     fn none() -> Self {
         Self(None)
     }
 
-    fn set(&mut self, sender: crate::body::Sender) {
+    fn set(&mut self, sender: crate::body::Sender<E>) {
         self.0 = Some(sender);
     }
 
-    fn take(&mut self) -> Option<crate::body::Sender> {
+    fn take(&mut self) -> Option<crate::body::Sender<E>> {
         self.0.take()
     }
 }
 
-impl Drop for SenderDropGuard {
+impl<E> Drop for SenderDropGuard<E> {
     fn drop(&mut self) {
         if let Some(mut sender) = self.0.take() {
             sender.send_error(crate::Error::new_incomplete());
@@ -807,15 +849,14 @@ impl Drop for SenderDropGuard {
 // ===== impl Server =====
 
 impl<
-    S: Service<Request<B>, Output = Response, Error = Infallible>,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError> + Send + 'static + Unpin>,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible>,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>,
 > Server<S, B>
 {
     pub(crate) fn new(service: S) -> Self {
         Self {
             in_flight: None,
             service,
-            _phantom: PhantomData,
         }
     }
 
@@ -826,18 +867,19 @@ impl<
 
 // Service is never pinned
 impl<
-    S: Service<Request<B>, Output = Response, Error = Infallible>,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError> + Send + 'static + Unpin>,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible>,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>,
 > Unpin for Server<S, B>
 {
 }
 
-impl<S> Dispatch for Server<S, IncomingBody>
+impl<S, B> Dispatch<B::Error> for Server<S, B>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible> + Clone,
 {
     type PollItem = MessageHead<StatusCode>;
-    type PollBody = Body;
+    type PollBody = B;
     type PollError = Infallible;
     type RecvItem = RequestHead;
 
@@ -867,8 +909,8 @@ where
 
     fn recv_msg(
         &mut self,
-        msg: crate::Result<(Self::RecvItem, IncomingBody)>,
-    ) -> crate::Result<()> {
+        msg: crate::Result<(Self::RecvItem, IncomingBody<B::Error>), B::Error>,
+    ) -> crate::Result<(), B::Error> {
         let (msg, body) = msg?;
         let mut req = Request::new(body);
         *req.method_mut() = msg.subject.0;
@@ -905,7 +947,7 @@ where
 
 use std::convert::Infallible;
 
-impl<B> Client<B> {
+impl<B: StreamingBody> Client<B> {
     pub(crate) fn new(rx: ClientRx<B>) -> Self {
         Self {
             callback: None,
@@ -915,9 +957,12 @@ impl<B> Client<B> {
     }
 }
 
-impl<B> Dispatch for Client<B>
+impl<B> Dispatch<B::Error> for Client<B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     type PollItem = RequestHead;
     type PollBody = B;
@@ -963,8 +1008,8 @@ where
 
     fn recv_msg(
         &mut self,
-        msg: crate::Result<(Self::RecvItem, IncomingBody)>,
-    ) -> crate::Result<()> {
+        msg: crate::Result<(Self::RecvItem, IncomingBody<B::Error>), B::Error>,
+    ) -> crate::Result<(), B::Error> {
         match msg {
             Ok((msg, body)) => {
                 if let Some(cb) = self.callback.take() {
@@ -1099,7 +1144,9 @@ mod tests {
             let mut dispatcher = Dispatcher::new(Client::new(rx), conn);
 
             // Complete an exchange to put the connection into idle keep-alive.
-            let first = tx.try_send(Request::new(IncomingBody::empty())).unwrap();
+            let first = tx
+                .try_send(Request::new(IncomingBody::<Infallible>::empty()))
+                .unwrap();
             let mut first = tokio_test::task::spawn(first);
             tokio_test::task::spawn(()).enter(|cx, _| {
                 assert!(Pin::new(&mut dispatcher).poll(cx).is_pending());
@@ -1112,7 +1159,7 @@ mod tests {
             state.set(ReadState::Close);
             let req = Request::builder()
                 .uri("/not-sent")
-                .body(IncomingBody::empty())
+                .body(IncomingBody::<Infallible>::empty())
                 .unwrap();
             let promise = tx.try_send(req).unwrap();
             let closing = poll_fn(|cx| dispatcher.poll_catch(cx, should_shutdown));
@@ -1154,36 +1201,65 @@ mod tests {
         }
     }
 
+    type EarlyDriverPoll = Poll<crate::Result<Dispatched, crate::Error>>;
+    type EarlyResponseDelivery = Result<
+        Response<IncomingBody<crate::Error>>,
+        TrySendError<Request<IncomingBody>, crate::Error>,
+    >;
+
+    #[derive(Debug)]
+    struct EarlyExchange {
+        driver: EarlyDriverPoll,
+        callback: Poll<Result<EarlyResponseDelivery, tokio::sync::oneshot::error::RecvError>>,
+    }
+
+    #[derive(Debug)]
+    struct EarlyResponseObservation {
+        initial: EarlyDriverPoll,
+        queued: Result<EarlyExchange, Request<IncomingBody>>,
+    }
+
     #[test]
-    fn client_read_bytes_before_writing_request() {
+    fn client_read_bytes_before_writing_request()
+    -> Result<(), Box<(&'static str, EarlyResponseObservation)>> {
         tokio_test::task::spawn(()).enter(|cx, _| {
+            // No writes are configured: the peer response must be rejected before
+            // the queued request is serialized onto the connection.
             let (io, mut handle) = tokio_test::io::Builder::new().build_with_handle();
             let io = ServiceInput::new(io);
-
-            // Block at 0 for now, but we will release this response before
-            // the request is ready to write later...
             let (mut tx, rx) = crate::client::dispatch::channel();
-            let conn = Conn::<_, rama_core::bytes::Bytes, ClientTransaction>::new(io);
+            let conn = Conn::<_, Bytes, ClientTransaction>::new(io);
             let mut dispatcher = Dispatcher::new(Client::new(rx), conn);
+            let initial = Pin::new(&mut dispatcher).poll(cx);
 
-            // First poll is needed to allow tx to send...
-            assert!(Pin::new(&mut dispatcher).poll(cx).is_pending());
-
-            // Unblock our IO, which has a response before we've sent request!
-            //
             handle.read(b"HTTP/1.1 200 OK\r\n\r\n");
+            let queued = tx
+                .try_send(Request::new(IncomingBody::<Infallible>::empty()))
+                .map(|mut receiver| EarlyExchange {
+                    driver: Pin::new(&mut dispatcher).poll(cx),
+                    callback: Pin::new(&mut receiver).poll(cx),
+                });
 
-            let mut res_rx = tx.try_send(Request::new(IncomingBody::empty())).unwrap();
-
-            tokio_test::assert_ready_ok!(Pin::new(&mut dispatcher).poll(cx));
-            let err = tokio_test::assert_ready_ok!(Pin::new(&mut res_rx).poll(cx))
-                .expect_err("callback should send error");
-
-            match (err.error.is_canceled(), err.message.as_ref()) {
-                (true, Some(_)) => (),
-                _ => panic!("expected Canceled, got {err:?}"),
-            }
-        });
+            let observed = EarlyResponseObservation { initial, queued };
+            let valid = matches!(observed.initial, Poll::Pending)
+                && matches!(&observed.queued,
+                    Ok(EarlyExchange {
+                        driver: Poll::Ready(Err(driver)),
+                        callback: Poll::Ready(Ok(Err(callback))),
+                    }) if matches!(driver.kind(), crate::error::Kind::UnexpectedMessage)
+                        && callback.error.is_canceled()
+                        && matches!(&callback.message, Some(request)
+                            if request.method() == rama_http_types::Method::GET
+                                && request.uri() == &rama_net::uri::Uri::default())
+                        && matches!(callback.error.cause_ref(), Some(crate::Cause::Http(cause))
+                            if matches!(cause.kind(), crate::error::Kind::UnexpectedMessage)));
+            valid.then_some(()).ok_or_else(|| {
+                Box::new((
+                    "retain the driver failure and return the unsent request to its caller",
+                    observed,
+                ))
+            })
+        })
     }
 
     #[cfg(not(miri))]
@@ -1205,7 +1281,8 @@ mod tests {
         let _dispatcher = tokio::spawn(dispatcher);
 
         let body = {
-            let (mut tx, body) = IncomingBody::new_channel(DecodedLength::new(4), false);
+            let (mut tx, body) =
+                IncomingBody::<Infallible>::new_channel(DecodedLength::new(4), false);
             tx.try_send_data("reee".into()).unwrap();
             body
         };
@@ -1236,7 +1313,7 @@ mod tests {
         assert!(dispatcher.poll().is_pending());
 
         let body = {
-            let (mut tx, body) = IncomingBody::channel();
+            let (mut tx, body) = IncomingBody::<Infallible>::channel();
             tx.try_send_data("".into()).unwrap();
             body
         };
@@ -1315,7 +1392,9 @@ mod tests {
             conn.close_read();
             conn.set_lingering_close(Some(LingeringClose::new().with_max_bytes(1)));
             let service = service_fn(|_req: Request<IncomingBody>| async {
-                Ok::<_, Infallible>(Response::new(Body::empty()))
+                Ok::<_, Infallible>(Response::new(
+                    rama_http_types::body::util::Empty::<Bytes>::new(),
+                ))
             });
             let mut dispatcher = Dispatcher::new(Server::new(service), conn);
             std::future::poll_fn(|cx| dispatcher.poll_linger(cx)).await;
@@ -1336,86 +1415,124 @@ mod tests {
             }
         }
     }
-    // Regression for #1014: when a server connection ends via a dispatch error,
-    // the dispatcher must still drive `poll_shutdown` on the transport (so e.g.
-    // a TLS stream emits close_notify) instead of dropping it mid-flight.
+    struct ShutdownIo {
+        request: Option<&'static [u8]>,
+        shutdown_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        shutdown_failure: Option<std::io::ErrorKind>,
+    }
+
+    impl AsyncRead for ShutdownIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.request.take() {
+                Some(mut request) => {
+                    let outcome = Pin::new(&mut request).poll_read(context, buffer);
+                    if !request.is_empty() {
+                        self.request = Some(request);
+                    }
+                    outcome
+                }
+                None => Poll::Ready(Err(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                ))),
+            }
+        }
+    }
+
+    impl AsyncWrite for ShutdownIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Poll::Ready(match self.shutdown_failure {
+                Some(cause) => Err(std::io::Error::from(cause)),
+                None => Ok(()),
+            })
+        }
+    }
+
+    async fn shutdown_after_read_failure(
+        request: Option<&'static [u8]>,
+        shutdown_failure: Option<std::io::ErrorKind>,
+    ) -> (crate::Result<Dispatched>, usize, usize) {
+        use crate::proto::h1::ServerTransaction;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+        let service_calls = Arc::new(AtomicUsize::new(0));
+        let io = ServiceInput::new(ShutdownIo {
+            request,
+            shutdown_failure,
+            shutdown_calls: Arc::clone(&shutdown_calls),
+        });
+        let observed_calls = Arc::clone(&service_calls);
+        let service = rama_core::service::service_fn(move |_: Request<IncomingBody>| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok::<_, Infallible>(Response::new(
+                    rama_http_types::body::util::Empty::<Bytes>::new(),
+                ))
+            }
+        });
+        let connection = Conn::<_, Bytes, ServerTransaction>::new(io);
+        let result = Dispatcher::new(Server::new(service), connection).await;
+        (
+            result,
+            shutdown_calls.load(Ordering::SeqCst),
+            service_calls.load(Ordering::SeqCst),
+        )
+    }
+
+    // A dispatch failure must still drive transport shutdown, including after
+    // the server has accepted a valid request.
     #[cfg(not(miri))]
     #[tokio::test]
-    async fn server_drives_shutdown_on_dispatch_error() {
-        use crate::proto::h1::ServerTransaction;
-        use rama_core::service::service_fn;
-        use std::convert::Infallible;
-        use std::io;
-        use std::pin::Pin;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::task::{Context, Poll};
-        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    async fn server_drives_shutdown_on_dispatch_error()
+    -> Result<(), (&'static str, (crate::Result<Dispatched>, usize, usize))> {
+        let observed =
+            shutdown_after_read_failure(Some(b"GET / HTTP/1.1\r\nhost: a\r\n\r\n"), None).await;
+        let (result, shutdown_calls, _) = &observed;
+        let valid = *shutdown_calls == 1
+            && matches!(result, Err(error) if matches!(error.cause_ref(), Some(crate::Cause::Io(cause))
+                if cause.kind() == std::io::ErrorKind::ConnectionReset));
+        valid.then_some(()).ok_or((
+            "preserve the read failure and perform required shutdown once",
+            observed,
+        ))
+    }
 
-        struct RecordIo {
-            // a valid request on the first read, then a hard error on the next.
-            request: Option<&'static [u8]>,
-            shutdown_called: Arc<AtomicBool>,
-        }
-
-        impl AsyncRead for RecordIo {
-            fn poll_read(
-                mut self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                buf: &mut ReadBuf<'_>,
-            ) -> Poll<io::Result<()>> {
-                match self.request.take() {
-                    Some(req) => {
-                        buf.put_slice(req);
-                        Poll::Ready(Ok(()))
-                    }
-                    // mid-connection transport failure on the next (keep-alive) read.
-                    None => Poll::Ready(Err(io::Error::other("boom"))),
-                }
-            }
-        }
-
-        impl AsyncWrite for RecordIo {
-            fn poll_write(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                buf: &[u8],
-            ) -> Poll<io::Result<usize>> {
-                // sink the response write
-                Poll::Ready(Ok(buf.len()))
-            }
-            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                self.shutdown_called.store(true, Ordering::SeqCst);
-                Poll::Ready(Ok(()))
-            }
-        }
-
-        let shutdown_called = Arc::new(AtomicBool::new(false));
-        let io = RecordIo {
-            request: Some(b"GET / HTTP/1.1\r\nhost: a\r\n\r\n"),
-            shutdown_called: shutdown_called.clone(),
-        };
-        let io = ServiceInput::new(io);
-
-        let service = service_fn(|_req: Request<IncomingBody>| async move {
-            Ok::<_, Infallible>(Response::new(Body::empty()))
-        });
-
-        let conn = Conn::<_, rama_core::bytes::Bytes, ServerTransaction>::new(io);
-        let dispatcher = Dispatcher::new(Server::new(service), conn);
-
-        let result = dispatcher.await;
-
-        assert!(
-            result.is_err(),
-            "an errored connection should surface its error"
-        );
-        assert!(
-            shutdown_called.load(Ordering::SeqCst),
-            "poll_shutdown must be driven on the dispatch error path (regression #1014)"
-        );
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn server_preserves_read_and_shutdown_failures_without_calling_service()
+    -> Result<(), (&'static str, (crate::Result<Dispatched>, usize, usize))> {
+        let observed =
+            shutdown_after_read_failure(None, Some(std::io::ErrorKind::BrokenPipe)).await;
+        let (result, shutdown_calls, service_calls) = &observed;
+        let valid = *shutdown_calls == 1
+            && *service_calls == 0
+            && matches!(result, Err(error) if matches!(error.cause_ref(), Some(crate::Cause::Finalization { original, cause })
+                if cause.kind() == std::io::ErrorKind::BrokenPipe
+                    && matches!(original.cause_ref(), Some(crate::Cause::Io(cause))
+                        if cause.kind() == std::io::ErrorKind::ConnectionReset)));
+        valid.then_some(()).ok_or((
+            "retain both failures and refuse application execution after input failure",
+            observed,
+        ))
     }
 }

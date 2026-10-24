@@ -1,6 +1,5 @@
 //! Http1 or Http2 connection.
 
-use rama_core::error::BoxErrorExt as _;
 use std::convert::Infallible;
 use std::io;
 use std::marker::PhantomPinned;
@@ -18,7 +17,6 @@ use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 
 use rama_core::bytes::Bytes;
-use rama_core::error::BoxError;
 use rama_core::io::rewind::Rewind;
 use rama_core::rt::Executor;
 
@@ -30,6 +28,73 @@ use super::{
 };
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Failure while detecting a protocol, before handing the stream to HTTP.
+#[derive(Debug)]
+pub enum DetectionError {
+    /// The underlying transport returned this native failure.
+    Io(io::Error),
+    /// The owner cancelled protocol detection during graceful shutdown.
+    Cancelled,
+    /// Detection was polled after transferring its stream.
+    AlreadyConsumed,
+}
+
+impl std::fmt::Display for DetectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(cause) => write!(formatter, "protocol detection failed: {cause}"),
+            Self::Cancelled => formatter.write_str("protocol detection cancelled"),
+            Self::AlreadyConsumed => formatter.write_str("protocol detection already completed"),
+        }
+    }
+}
+
+impl std::error::Error for DetectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(cause) => Some(cause),
+            Self::Cancelled | Self::AlreadyConsumed => None,
+        }
+    }
+}
+
+/// Complete failure of an automatically selected HTTP connection.
+#[derive(Debug)]
+pub enum AutoConnectionError {
+    /// Protocol detection failed before an HTTP connection was established.
+    Detection(DetectionError),
+    /// The HTTP/1 connection failed, retaining its body and finalization causes.
+    Http1(crate::Error<rama_core::error::ArcError>),
+    /// The HTTP/2 connection failed.
+    Http2(crate::Error),
+    /// The connection was polled after its application service was transferred.
+    ServiceConsumed,
+}
+
+impl std::fmt::Display for AutoConnectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Detection(cause) => cause.fmt(formatter),
+            Self::Http1(cause) => cause.fmt(formatter),
+            Self::Http2(cause) => cause.fmt(formatter),
+            Self::ServiceConsumed => {
+                formatter.write_str("HTTP connection service already consumed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AutoConnectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Detection(cause) => Some(cause),
+            Self::Http1(cause) => Some(cause),
+            Self::Http2(cause) => Some(cause),
+            Self::ServiceConsumed => None,
+        }
+    }
+}
 
 /// Http1 or Http2 connection builder.
 #[derive(Clone, Debug)]
@@ -149,7 +214,11 @@ impl Builder {
     /// Bind a connection together with a [`Service`].
     pub fn serve_connection<I, S>(&self, io: I, service: S) -> Connection<'_, I, S>
     where
-        S: Service<Request<Incoming>, Output = Response, Error = Infallible> + Clone,
+        S: Service<
+                Request<Incoming<rama_core::error::ArcError>>,
+                Output = Response,
+                Error = Infallible,
+            > + Clone,
         I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
     {
         let state = match self.version {
@@ -182,7 +251,11 @@ impl Builder {
         service: S,
     ) -> UpgradeableConnection<'_, I, S>
     where
-        S: Service<Request<Incoming>, Output = Response, Error = Infallible>,
+        S: Service<
+                Request<Incoming<rama_core::error::ArcError>>,
+                Output = Response,
+                Error = Infallible,
+            >,
         I: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         UpgradeableConnection {
@@ -249,12 +322,12 @@ impl<I> Future for ReadVersion<I>
 where
     I: AsyncRead + Unpin,
 {
-    type Output = io::Result<(Version, Rewind<I>, ConnTimer)>;
+    type Output = Result<(Version, Rewind<I>, ConnTimer), DetectionError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         if *this.cancelled {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled")));
+            return Poll::Ready(Err(DetectionError::Cancelled));
         }
 
         let mut buf = ReadBuf::new(&mut *this.buf);
@@ -263,14 +336,12 @@ where
         // We start as H2 and switch to H1 as soon as we don't have the preface.
         while buf.filled().len() < H2_PREFACE.len() {
             let Some(io) = this.io.as_mut() else {
-                return Poll::Ready(Err(std::io::Error::other(BoxError::from_static_str(
-                    "unexpected error: ReadVersion(..., >IO<) already taken in earlier Poll::ready, cannot read from it, report bug in rama repo",
-                ))));
+                return Poll::Ready(Err(DetectionError::AlreadyConsumed));
             };
 
             let len = buf.filled().len();
             match Pin::new(io).poll_read(cx, &mut buf) {
-                Poll::Ready(result) => result?,
+                Poll::Ready(result) => result.map_err(DetectionError::Io)?,
                 Poll::Pending => {
                     let activity = if buf.filled().is_empty() {
                         Activity::Idle
@@ -301,9 +372,7 @@ where
         }
 
         let Some(io) = this.io.take() else {
-            return Poll::Ready(Err(std::io::Error::other(BoxError::from_static_str(
-                "unexpected error: ReadVersion(..., >IO<) already taken in earlier Poll::ready, cannot take it again, report bug in rama repo",
-            ))));
+            return Poll::Ready(Err(DetectionError::AlreadyConsumed));
         };
 
         let buf = buf.filled().to_vec();
@@ -324,7 +393,7 @@ pin_project! {
     #[must_use = "futures do nothing unless polled"]
     pub struct Connection<'a, I, S>
     where
-        S: Service<Request<Incoming>, Output = Response, Error = Infallible>,
+        S: Service<Request<Incoming<rama_core::error::ArcError>>, Output = Response, Error = Infallible>,
     {
         #[pin]
         state: ConnState<'a, I, S>,
@@ -355,7 +424,7 @@ pin_project! {
     #[project = ConnStateProj]
     enum ConnState<'a, I, S>
     where
-        S: Service<Request<Incoming>, Output = Response, Error = Infallible>,
+        S: Service<Request<Incoming<rama_core::error::ArcError>>, Output = Response, Error = Infallible>,
     {
         ReadVersion {
             #[pin]
@@ -376,7 +445,11 @@ pin_project! {
 
 impl<I, S> Connection<'_, I, S>
 where
-    S: Service<Request<Incoming>, Output = Response, Error = Infallible> + Clone,
+    S: Service<
+            Request<Incoming<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        > + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
     /// Start a graceful shutdown process for this connection.
@@ -420,10 +493,14 @@ where
 
 impl<I, S> Future for Connection<'_, I, S>
 where
-    S: Service<Request<Incoming>, Output = Response, Error = Infallible> + Clone,
+    S: Service<
+            Request<Incoming<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        > + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
-    type Output = Result<(), BoxError>;
+    type Output = Result<(), AutoConnectionError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
@@ -435,11 +512,10 @@ where
                     builder,
                     service,
                 } => {
-                    let (version, io, timer) = ready!(read_version.poll(cx))?;
+                    let (version, io, timer) =
+                        ready!(read_version.poll(cx)).map_err(AutoConnectionError::Detection)?;
                     let Some(service) = service.take() else {
-                        return Poll::Ready(Err(BoxError::from_static_str(
-                            "unexpected error: auto http svc in connection already taken, report bug in rama repo",
-                        )));
+                        return Poll::Ready(Err(AutoConnectionError::ServiceConsumed));
                     };
                     match version {
                         Version::H1 => {
@@ -457,10 +533,10 @@ where
                     }
                 }
                 ConnStateProj::H1 { conn } => {
-                    return conn.poll(cx).map_err(Into::into);
+                    return conn.poll(cx).map_err(AutoConnectionError::Http1);
                 }
                 ConnStateProj::H2 { conn } => {
-                    return conn.poll(cx).map_err(Into::into);
+                    return conn.poll(cx).map_err(AutoConnectionError::Http2);
                 }
             }
         }
@@ -476,7 +552,7 @@ pin_project! {
     #[must_use = "futures do nothing unless polled"]
     pub struct UpgradeableConnection<'a, I, S>
     where
-        S: Service<Request<Incoming>, Output = Response, Error = Infallible>,
+        S: Service<Request<Incoming<rama_core::error::ArcError>>, Output = Response, Error = Infallible>,
     {
         #[pin]
         state: UpgradeableConnState<'a, I, S>,
@@ -489,7 +565,7 @@ pin_project! {
     #[project = UpgradeableConnStateProj]
     enum UpgradeableConnState<'a, I, S>
     where
-        S: Service<Request<Incoming>, Output = Response, Error = Infallible>,
+        S: Service<Request<Incoming<rama_core::error::ArcError>>, Output = Response, Error = Infallible>,
     {
         ReadVersion {
             #[pin]
@@ -510,7 +586,11 @@ pin_project! {
 
 impl<I, S> UpgradeableConnection<'_, I, S>
 where
-    S: Service<Request<Incoming>, Output = Response, Error = Infallible> + Clone,
+    S: Service<
+            Request<Incoming<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        > + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
     /// Start a graceful shutdown process for this connection.
@@ -554,10 +634,14 @@ where
 
 impl<I, S> Future for UpgradeableConnection<'_, I, S>
 where
-    S: Service<Request<Incoming>, Output = Response, Error = Infallible> + Clone,
+    S: Service<
+            Request<Incoming<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        > + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
-    type Output = Result<(), BoxError>;
+    type Output = Result<(), AutoConnectionError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
@@ -569,11 +653,10 @@ where
                     builder,
                     service,
                 } => {
-                    let (version, io, timer) = ready!(read_version.poll(cx))?;
+                    let (version, io, timer) =
+                        ready!(read_version.poll(cx)).map_err(AutoConnectionError::Detection)?;
                     let Some(service) = service.take() else {
-                        return Poll::Ready(Err(BoxError::from_static_str(
-                            "unexpected error: auto http svc in upgradeable connection already taken, report bug in rama repo",
-                        )));
+                        return Poll::Ready(Err(AutoConnectionError::ServiceConsumed));
                     };
                     match version {
                         Version::H1 => {
@@ -592,10 +675,10 @@ where
                     }
                 }
                 UpgradeableConnStateProj::H1 { conn } => {
-                    return conn.poll(cx).map_err(Into::into);
+                    return conn.poll(cx).map_err(AutoConnectionError::Http1);
                 }
                 UpgradeableConnStateProj::H2 { conn } => {
-                    return conn.poll(cx).map_err(Into::into);
+                    return conn.poll(cx).map_err(AutoConnectionError::Http2);
                 }
             }
         }
@@ -604,12 +687,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::{AutoConnectionError, DetectionError};
     use crate::client::conn::http1;
     use crate::server::conn::auto;
     use crate::service::RamaHttpService;
     use crate::{body::Bytes, client};
     use rama_core::ServiceInput;
-    use rama_core::error::BoxError;
     use rama_core::rt::Executor;
     use rama_core::service::service_fn;
     use rama_http::StreamingBody;
@@ -721,48 +804,70 @@ mod tests {
             .expect_err("should fail");
     }
 
+    type ShutdownObservation = Result<Result<(), AutoConnectionError>, tokio::time::error::Elapsed>;
+
+    enum ShutdownTestFailure {
+        Bind(std::io::Error),
+        Address(std::io::Error),
+        Connect(std::io::Error),
+        Accept(std::io::Error),
+        State((&'static str, ShutdownObservation)),
+    }
+
+    impl std::fmt::Debug for ShutdownTestFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Bind(cause) => formatter.debug_tuple("Bind").field(cause).finish(),
+                Self::Address(cause) => formatter.debug_tuple("Address").field(cause).finish(),
+                Self::Connect(cause) => formatter.debug_tuple("Connect").field(cause).finish(),
+                Self::Accept(cause) => formatter.debug_tuple("Accept").field(cause).finish(),
+                Self::State(cause) => formatter.debug_tuple("State").field(cause).finish(),
+            }
+        }
+    }
+
     #[cfg(not(miri))]
     #[tokio::test]
-    async fn graceful_shutdown() {
-        use rama_core::{ServiceInput, service::service_fn};
-
-        use crate::service::RamaHttpService;
-
+    async fn graceful_shutdown() -> Result<(), ShutdownTestFailure> {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
-            .unwrap();
-
-        let listener_addr = listener.local_addr().unwrap();
-
-        // Spawn the task in background so that we can connect there
-        let listen_task = tokio::spawn(async move { listener.accept().await.unwrap() });
-        // Only connect a stream, do not send headers or anything
-        let _stream = TcpStream::connect(listener_addr).await.unwrap();
-
-        let (stream, _) = listen_task.await.unwrap();
-        let stream = ServiceInput::new(stream);
-
-        let builder = auto::Builder::new(Executor::new());
-        let connection = builder.serve_connection(stream, RamaHttpService::new(service_fn(hello)));
-
-        pin!(connection);
-
-        connection.as_mut().graceful_shutdown();
-
-        let connection_error = tokio::time::timeout(Duration::from_millis(200), connection)
+            .map_err(ShutdownTestFailure::Bind)?;
+        let address = listener
+            .local_addr()
+            .map_err(ShutdownTestFailure::Address)?;
+        let peer = TcpStream::connect(address)
             .await
-            .expect("Connection should have finished in a timely manner after graceful shutdown.")
-            .expect_err("Connection should have been interrupted.");
-
-        let connection_error = connection_error
-            .downcast_ref::<std::io::Error>()
-            .expect("The error should have been `std::io::Error`.");
-        assert_eq!(connection_error.kind(), std::io::ErrorKind::Interrupted);
+            .map_err(ShutdownTestFailure::Connect)?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(ShutdownTestFailure::Accept)?;
+        let builder = auto::Builder::new(Executor::new());
+        let connection = builder.serve_connection(
+            ServiceInput::new(stream),
+            RamaHttpService::new(service_fn(hello)),
+        );
+        pin!(connection);
+        connection.as_mut().graceful_shutdown();
+        let observed = tokio::time::timeout(Duration::from_millis(200), connection).await;
+        drop(peer);
+        let valid = matches!(
+            observed,
+            Ok(Err(AutoConnectionError::Detection(
+                DetectionError::Cancelled
+            )))
+        );
+        valid.then_some(()).ok_or_else(|| ShutdownTestFailure::State((
+            "graceful shutdown returns its actual cancellation state within the existing deadline", observed,
+        )))
     }
 
     async fn connect_h1<B>(addr: SocketAddr) -> client::conn::http1::SendRequest<B>
     where
-        B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + 'static
+            + Unpin,
     {
         let stream = TcpStream::connect(addr).await.unwrap();
         let stream = ServiceInput::new(stream);
@@ -775,7 +880,10 @@ mod tests {
 
     async fn connect_h2<B>(addr: SocketAddr) -> client::conn::http2::SendRequest<B>
     where
-        B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + 'static
+            + Unpin,
     {
         let stream = TcpStream::connect(addr).await.unwrap();
         let stream = ServiceInput::new(stream);
@@ -832,12 +940,12 @@ mod tests {
 
 #[cfg(test)]
 mod timeout_tests {
-    use super::{Builder, H2_PREFACE, Version, read_version};
+    use super::{AutoConnectionError, Builder, H2_PREFACE, Version, read_version};
     use crate::{
         server::conn::{HeaderReadTimeout, IdleTimeout, timeout::ConnTimer},
         service::RamaHttpService,
     };
-    use rama_core::{ServiceInput, error::BoxError, rt::Executor, service::service_fn};
+    use rama_core::{ServiceInput, rt::Executor, service::service_fn};
     use rama_http_types::{Body, Request, Response};
     use std::{convert::Infallible, future::poll_fn, task::Poll, time::Duration};
     use tokio::{
@@ -853,7 +961,7 @@ mod timeout_tests {
         ConnTimer::new(Some(IdleTimeout::DEFAULT), Some(HeaderReadTimeout::DEFAULT))
     }
 
-    fn serve(builder: Builder) -> (DuplexStream, JoinHandle<Result<(), BoxError>>) {
+    fn serve(builder: Builder) -> (DuplexStream, JoinHandle<Result<(), AutoConnectionError>>) {
         let (client, server) = duplex(64 * 1024);
         let task = spawn(async move {
             builder
@@ -874,10 +982,16 @@ mod timeout_tests {
         }
     }
 
-    fn is_header_timeout(error: &BoxError) -> bool {
-        error
-            .downcast_ref::<crate::Error>()
-            .is_some_and(crate::Error::is_timeout)
+    fn is_header_timeout(error: &AutoConnectionError) -> bool {
+        match error {
+            AutoConnectionError::Http1(cause) => {
+                matches!(cause.kind(), crate::error::Kind::HeaderTimeout)
+            }
+            AutoConnectionError::Http2(cause) => {
+                matches!(cause.kind(), crate::error::Kind::HeaderTimeout)
+            }
+            AutoConnectionError::Detection(_) | AutoConnectionError::ServiceConsumed => false,
+        }
     }
 
     #[tokio::test(start_paused = true)]

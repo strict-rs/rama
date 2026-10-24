@@ -116,9 +116,13 @@ async fn idle_recovery(reserve_before_timeout: bool) {
                     move |request: Request<RetryBody>, result: Result<Response, BoxError>| {
                         let rejected = result.as_ref().err().is_some_and(|error| {
                             error_chain(error.as_ref()).any(|error| {
-                                error.downcast_ref::<HttpError>().is_some_and(|error| {
-                                    error.is_canceled() || error.is_closed() || error.is_refused()
-                                })
+                                error
+                                    .downcast_ref::<HttpError<rama_core::error::ArcError>>()
+                                    .is_some_and(|error| {
+                                        error.is_canceled()
+                                            || error.is_closed()
+                                            || error.is_refused()
+                                    })
                             })
                         });
                         if rejected {

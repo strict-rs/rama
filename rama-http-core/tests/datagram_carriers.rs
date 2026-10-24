@@ -454,7 +454,10 @@ async fn echoes(upgraded: Upgraded) {
 }
 
 /// A refused Extended CONNECT or Upgrade is an ordinary response with its body.
-async fn refused_then_served(response: Response<Incoming>, version: Version) {
+async fn refused_then_served<E>(response: Response<Incoming<E>>, version: Version)
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     validate_capsule_response(version, &TOKEN, &response, ViolationPolicy::Ignore).unwrap_err();
     let body = response.into_body().collect().await.unwrap().to_bytes();

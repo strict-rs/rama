@@ -176,7 +176,7 @@ mod tests {
             let (io, _peer) = tokio::io::duplex(1024);
             let (mut sender, driver) = rama_http_core::client::conn::http1::handshake::<
                 _,
-                rama_http_types::Body,
+                rama_http_types::body::util::Empty<rama_core::bytes::Bytes>,
             >(rama_core::ServiceInput::new(io))
             .await
             .unwrap();
@@ -189,7 +189,7 @@ mod tests {
                 let request = rama_http_types::Request::connect(
                     rama_net::uri::Uri::parse_authority_form("example.com:443").unwrap(),
                 )
-                .body(rama_http_types::Body::empty())
+                .body(rama_http_types::body::util::Empty::new())
                 .unwrap();
                 let error = sender.send_request(request).await.unwrap_err();
                 assert!(error.is_canceled());

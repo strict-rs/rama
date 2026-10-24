@@ -93,7 +93,6 @@ mod tests {
         body::util::{BodyExt as _, CollectErrorKind, LengthLimitError},
         request,
     };
-    use std::assert_matches;
     use tokio::io::DuplexStream;
 
     fn streaming_body() -> Body {
@@ -210,26 +209,37 @@ mod tests {
         Http2,
     }
 
-    async fn oversized_request_status(protocol: TestProtocol) -> StatusCode {
+    type RequestCollection =
+        Result<rama_http_types::body::util::Collected<Bytes>, rama_http_types::body::CollectError>;
+    type DriverResult =
+        Result<crate::Result<(), rama_core::error::ArcError>, tokio::task::JoinError>;
+
+    #[derive(Debug)]
+    struct LimitObservation {
+        response: crate::Result<StatusCode, rama_core::error::ArcError>,
+        collected: Option<RequestCollection>,
+        client: Option<DriverResult>,
+        server: DriverResult,
+    }
+
+    async fn oversized_request_status(protocol: TestProtocol) -> LimitObservation {
         let (client_io, server_io) = tokio::io::duplex(4096);
-        let http_service = RamaHttpService::new(service_fn(|request: Request| async move {
-            let status = match request.into_body().collect().await {
-                Ok(_) => StatusCode::OK,
-                Err(error) => {
-                    assert_matches!(
-                        error.kind(),
-                        CollectErrorKind::Stream(error)
-                            if error.downcast_ref::<LengthLimitError>().is_some(),
-                    );
+        let collected = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let capture = std::sync::Arc::clone(&collected);
+        let http_service = RamaHttpService::new(service_fn(move |request: Request| {
+            let capture = std::sync::Arc::clone(&capture);
+            async move {
+                let received = request.into_body().collect().await;
+                let status = if received.is_err() {
                     StatusCode::PAYLOAD_TOO_LARGE
-                }
-            };
-            Ok::<_, Infallible>(
-                Response::builder()
-                    .status(status)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+                } else {
+                    StatusCode::OK
+                };
+                *capture.lock().await = Some(received);
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = status;
+                Ok::<_, Infallible>(response)
+            }
         }));
         let server_io = ServiceInput::new(server_io);
         let server_task = match protocol {
@@ -253,6 +263,7 @@ mod tests {
                         crate::server::conn::http2::Builder::new(Executor::new())
                             .serve_connection(io, http_service)
                             .await
+                            .map_err(crate::Error::into_body_error::<rama_core::error::ArcError>)
                     }
                 });
                 let connection_service =
@@ -260,46 +271,90 @@ mod tests {
                 tokio::spawn(async move { connection_service.serve(server_io).await })
             }
         };
-
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/")
-            .body(streaming_body())
-            .unwrap();
-        let (response, client_task) = match protocol {
+        let mut request = Request::new(streaming_body());
+        *request.method_mut() = Method::POST;
+        let mut client_task = None;
+        let response = match protocol {
             TestProtocol::Http1 => {
-                let (mut sender, connection) =
-                    crate::client::conn::http1::handshake::<_, Body>(ServiceInput::new(client_io))
-                        .await
-                        .unwrap();
-                let client_task = tokio::spawn(connection);
-                (sender.send_request(request).await.unwrap(), client_task)
+                match crate::client::conn::http1::handshake::<_, Body>(ServiceInput::new(client_io))
+                    .await
+                {
+                    Ok((mut sender, connection)) => {
+                        client_task = Some(tokio::spawn(connection));
+                        sender
+                            .send_request(request)
+                            .await
+                            .map(|response| response.status())
+                    }
+                    Err(cause) => Err(cause),
+                }
             }
             TestProtocol::Http2 => {
-                let (mut sender, connection) = crate::client::conn::http2::handshake::<_, Body>(
+                match crate::client::conn::http2::handshake::<_, Body>(
                     Executor::new(),
                     ServiceInput::new(client_io),
                 )
                 .await
-                .unwrap();
-                let client_task = tokio::spawn(connection);
-                (sender.send_request(request).await.unwrap(), client_task)
+                {
+                    Ok((mut sender, connection)) => {
+                        client_task = Some(tokio::spawn(connection));
+                        sender
+                            .send_request(request)
+                            .await
+                            .map(|response| response.status())
+                    }
+                    Err(cause) => Err(cause),
+                }
             }
         };
-        let status = response.status();
-        client_task.abort();
+        // These fixture peers are deliberately stopped after the observed reply;
+        // retain their terminal results instead of detaching their join handles.
+        if let Some(task) = &client_task {
+            task.abort();
+        }
         server_task.abort();
-        status
+        let client = match client_task {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        let server = server_task.await;
+        let collected = collected.lock().await.take();
+        LimitObservation {
+            response,
+            collected,
+            client,
+            server,
+        }
     }
 
     #[tokio::test]
-    async fn transport_body_limit_reaches_http1_and_http2_requests() {
+    async fn transport_body_limit_reaches_http1_and_http2_requests()
+    -> Result<(), Box<(&'static str, LimitObservation)>> {
         for protocol in [TestProtocol::Http1, TestProtocol::Http2] {
-            assert_eq!(
-                oversized_request_status(protocol).await,
-                StatusCode::PAYLOAD_TOO_LARGE
-            );
+            let observed = oversized_request_status(protocol).await;
+            let valid = matches!(observed.response, Ok(StatusCode::PAYLOAD_TOO_LARGE))
+                && matches!(&observed.collected, Some(Err(error))
+                    if error.bytes_read().len() <= 5
+                        && b"12345678".starts_with(error.bytes_read().as_ref())
+                        && matches!(error.kind(), CollectErrorKind::Stream(cause)
+                            if rama_core::error::error_chain(cause.as_ref())
+                                .any(|source| source.is::<LengthLimitError>())))
+                && observed.client.as_ref().is_some_and(|result| match result {
+                    Ok(_) => true,
+                    Err(cause) => cause.is_cancelled(),
+                })
+                && match &observed.server {
+                    Ok(_) => true,
+                    Err(cause) => cause.is_cancelled(),
+                };
+            if !valid {
+                return Err(Box::new((
+                    "both protocols enforce the byte limit and preserve its native cause and valid prefix",
+                    observed,
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]

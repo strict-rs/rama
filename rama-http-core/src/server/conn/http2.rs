@@ -29,7 +29,7 @@ pin_project! {
     #[must_use = "futures do nothing unless polled"]
     pub struct Connection<T, S>
     where
-        S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+        S: Service<Request<IncomingBody<rama_core::error::ArcError>>, Output = Response, Error = Infallible>,
     {
         conn: proto::h2::Server<T, S>,
     }
@@ -49,7 +49,11 @@ pub struct Builder {
 
 impl<I, S> fmt::Debug for Connection<I, S>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+    S: Service<
+            Request<IncomingBody<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        >,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection").finish()
@@ -58,7 +62,11 @@ where
 
 impl<I, S> Connection<I, S>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+    S: Service<
+            Request<IncomingBody<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        >,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
     /// Start a graceful shutdown process for this connection.
@@ -78,7 +86,11 @@ where
 
 impl<I, S> Future for Connection<I, S>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+    S: Service<
+            Request<IncomingBody<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        > + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
     type Output = crate::Result<()>;
@@ -367,7 +379,11 @@ impl Builder {
     /// [`Extensions`]: rama_core::extensions::Extensions
     pub fn serve_connection<S, I>(&self, io: I, service: S) -> Connection<I, S>
     where
-        S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+        S: Service<
+                Request<IncomingBody<rama_core::error::ArcError>>,
+                Output = Response,
+                Error = Infallible,
+            >,
         I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
     {
         let timer = ConnTimer::new(
@@ -385,7 +401,11 @@ impl Builder {
         timer: ConnTimer,
     ) -> Connection<I, S>
     where
-        S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+        S: Service<
+                Request<IncomingBody<rama_core::error::ArcError>>,
+                Output = Response,
+                Error = Infallible,
+            >,
         I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
     {
         let h2_builder = if let Some(params) = io.extensions().get_ref::<H2ServerContextParams>() {

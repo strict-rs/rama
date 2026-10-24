@@ -31,7 +31,7 @@ use crate::{
 use pin_project_lite::pin_project;
 use rama_core::{
     Layer, Service,
-    error::{BoxError, error_chain},
+    error::{ArcError, BoxError, error_chain},
     extensions::{Extensions, ExtensionsRef},
 };
 use rama_http_headers::{AltUsed, HeaderMapExt as _, TypedHeader as _};
@@ -223,6 +223,8 @@ fn is_remote_response_failure(error: &dyn Any) -> bool {
             error
         } else if let Some(error) = error.downcast_ref::<BoxError>() {
             error.as_ref()
+        } else if let Some(error) = error.downcast_ref::<ArcError>() {
+            error.as_error()
         } else {
             return false;
         };
@@ -630,29 +632,80 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    enum FailureForm {
+        Classified(ConnectionError),
+        Boxed(BoxError),
+        Shared(ArcError),
+        Response(Box<Response>),
+    }
+
+    type FailureClassification = (FailureForm, bool, bool);
+
     #[test]
-    fn local_or_unclassified_response_errors_cannot_expose_nested_remote_failures() {
+    fn local_or_unclassified_response_errors_cannot_expose_nested_remote_failures()
+    -> Result<(), Vec<FailureClassification>> {
         let remote = || {
             ConnectionError::application(
                 BoxError::from_static_str("remote reset"),
                 ConnectionErrorKind::Unavailable,
             )
         };
-        assert!(is_remote_response_failure(&remote()));
-        let boxed: BoxError = Box::new(remote());
-        assert!(is_remote_response_failure(&boxed));
+        let mut inputs = vec![
+            (FailureForm::Classified(remote()), true),
+            (FailureForm::Boxed(Box::new(remote())), true),
+            (FailureForm::Shared(ArcError::new(remote())), true),
+            (
+                FailureForm::Response(Box::new(Response::new(Body::empty()))),
+                false,
+            ),
+            (
+                FailureForm::Boxed(BoxError::from_static_str("application failure")),
+                false,
+            ),
+            (
+                FailureForm::Shared(ArcError::from_static_str("application failure")),
+                false,
+            ),
+        ];
         for domain in [ConnectionErrorDomain::Local, ConnectionErrorDomain::Unknown] {
-            let error: BoxError = Box::new(ConnectionError::new(
-                Box::new(remote()),
-                domain,
-                ConnectionErrorKind::Other,
+            inputs.push((
+                FailureForm::Boxed(Box::new(ConnectionError::new(
+                    Box::new(remote()),
+                    domain,
+                    ConnectionErrorKind::Other,
+                ))),
+                false,
             ));
-            assert!(!is_remote_response_failure(&error));
+            inputs.push((
+                FailureForm::Shared(ArcError::new(ConnectionError::new(
+                    Box::new(remote()),
+                    domain,
+                    ConnectionErrorKind::Other,
+                ))),
+                false,
+            ));
         }
-        assert!(!is_remote_response_failure(&Response::new(Body::empty())));
-        assert!(!is_remote_response_failure(&BoxError::from_static_str(
-            "application failure"
-        )));
+        let observed: Vec<_> = inputs
+            .into_iter()
+            .map(|(error, expected_remote)| {
+                let observed_remote = match &error {
+                    FailureForm::Classified(cause) => is_remote_response_failure(cause),
+                    FailureForm::Boxed(cause) => is_remote_response_failure(cause),
+                    FailureForm::Shared(cause) => is_remote_response_failure(cause),
+                    FailureForm::Response(response) => {
+                        is_remote_response_failure(response.as_ref())
+                    }
+                };
+                (error, expected_remote, observed_remote)
+            })
+            .collect();
+        // Keep each complete subject alongside the classification, including
+        // shared causes and the response form that deliberately is not an error.
+        let correct = observed
+            .iter()
+            .all(|(_, expected, received)| expected == received);
+        correct.then_some(()).ok_or(observed)
     }
 
     #[tokio::test]

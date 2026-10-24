@@ -3,6 +3,7 @@
 //! As defined in <https://github.com/plabayo/rama/blob/main/rama-http-core/specifications/rfc9112.txt>.
 
 use super::HttpProxyError;
+use rama_core::bytes::Bytes;
 use rama_core::error::{BoxError, ErrorContext};
 use rama_core::extensions::{Extensions, ExtensionsRef};
 use rama_core::io::Io;
@@ -14,7 +15,9 @@ use rama_http_core::body::Incoming;
 use rama_http_core::client::conn::{http1, http2};
 use rama_http_headers::{HeaderEncode, HeaderMapExt, Host, HttpRequestBuilderExt, UserAgent};
 use rama_http_types::Response;
-use rama_http_types::{Body, HeaderName, HeaderValue, Method, Request, StatusCode, Version};
+use rama_http_types::{
+    HeaderName, HeaderValue, Method, Request, StatusCode, Version, body::util::Empty,
+};
 use rama_net::address::HostWithOptPort;
 use rama_net::uri::Uri;
 use rama_utils::macros::generate_set_and_with;
@@ -24,7 +27,7 @@ use rama_utils::macros::generate_set_and_with;
 ///
 /// Used to connect as a client to a HTTP proxy server.
 pub(super) struct InnerHttpProxyConnector {
-    req: Request,
+    req: Request<Empty<Bytes>>,
 }
 
 impl InnerHttpProxyConnector {
@@ -42,7 +45,7 @@ impl InnerHttpProxyConnector {
             .uri(Uri::from_authority_form(authority.clone().into()))
             .typed_header(Host::from(authority))
             .typed_header(UserAgent::rama())
-            .body(Body::empty())
+            .body(Empty::new())
             .context("build http request")?
             .with_extensions(req_extensions);
 
@@ -101,7 +104,7 @@ impl InnerHttpProxyConnector {
     }
 
     async fn handshake_h1<S: Io + ExtensionsRef + Unpin>(
-        req: Request,
+        req: Request<Empty<Bytes>>,
         stream: S,
     ) -> Result<Response<Incoming>, HttpProxyError> {
         let (mut tx, conn) = http1::Builder::default()
@@ -122,7 +125,7 @@ impl InnerHttpProxyConnector {
     }
 
     async fn handshake_h2<S: Io + ExtensionsRef + Unpin>(
-        req: Request,
+        req: Request<Empty<Bytes>>,
         stream: S,
     ) -> Result<Response<Incoming>, HttpProxyError> {
         let (mut tx, conn) = http2::Builder::new(Executor::new())

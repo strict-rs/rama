@@ -16,7 +16,6 @@ use pin_project_lite::pin_project;
 use rama_core::{
     bytes::Bytes,
     combinators::Either,
-    error::BoxError,
     extensions::ExtensionsRef,
     futures::{Stream, future::FusedFuture, stream::FusedStream},
     rt::Executor,
@@ -52,7 +51,11 @@ use crate::{
     proto::Dispatched,
 };
 
-type ClientRx<B> = crate::client::dispatch::Receiver<Request<B>, Response<IncomingBody>>;
+type ClientRx<B> = crate::client::dispatch::Receiver<
+    Request<B>,
+    Response<IncomingBody<<B as StreamingBody>::Error>>,
+    <B as StreamingBody>::Error,
+>;
 
 ///// An mpsc channel is used to help notify the `Connection` task when *all*
 ///// other handles to it have been dropped, so that it can shutdown.
@@ -193,10 +196,13 @@ pub(crate) async fn handshake<T, B>(
     req_rx: ClientRx<B>,
     config: &Config,
     exec: Executor,
-) -> crate::Result<ClientTask<B, T>>
+) -> crate::Result<ClientTask<B, T>, B::Error>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     handshake_with_builder(new_builder(config), io, req_rx, config, exec).await
 }
@@ -207,10 +213,13 @@ pub(crate) async fn handshake_with_builder<T, B>(
     req_rx: ClientRx<B>,
     config: &Config,
     exec: Executor,
-) -> crate::Result<ClientTask<B, T>>
+) -> crate::Result<ClientTask<B, T>, B::Error>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     let extensions = io.extensions().clone();
     let (h2_tx, mut conn) = builder
@@ -234,8 +243,7 @@ where
     let (conn, ping) = if ping_config.is_enabled() {
         let Some(pp) = conn.ping_pong() else {
             return Err(
-                crate::Error::new_parse_internal()
-                    .with_display("bug: report in rama crate: client: conn.ping_pong not available while ping config is enabled"),
+                crate::Error::new_parse_internal().with(crate::StateFailure::ClientPingUnavailable)
             );
         };
         let (recorder, ponger) = ping::channel(pp, &ping_config);
@@ -287,7 +295,10 @@ pin_project! {
         B: Unpin,
         B::Data: Send,
         B::Data: 'static,
-        B::Error: Into<BoxError>,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
     {
         #[pin]
         ponger: Ponger,
@@ -298,7 +309,10 @@ pin_project! {
 
 impl<T, B> Conn<T, B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     fn new(ponger: Ponger, conn: Connection<T, SendBuf<<B as StreamingBody>::Data>>) -> Self {
@@ -308,7 +322,10 @@ where
 
 impl<T, B> Future for Conn<T, B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef + 'static,
 {
     type Output = Result<(), crate::h2::Error>;
@@ -340,7 +357,10 @@ pin_project! {
         B: Unpin,
         B::Data: Send,
         B::Data: 'static,
-        B::Error: Into<BoxError>,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
         T: AsyncRead,
         T: AsyncWrite,
         T: Unpin,
@@ -356,7 +376,10 @@ pin_project! {
 
 impl<T, B> Future for ConnMapErr<T, B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef,
 {
     type Output = Result<(), ()>;
@@ -384,7 +407,10 @@ where
 
 impl<T, B> FusedFuture for ConnMapErr<T, B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef + 'static,
 {
     fn is_terminated(&self) -> bool {
@@ -401,7 +427,10 @@ pin_project! {
         B: Unpin,
         B::Data: Send,
         B::Data: 'static,
-        B::Error: Into<BoxError>,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
         T: AsyncRead,
         T: AsyncWrite,
         T: Unpin,
@@ -419,7 +448,10 @@ pin_project! {
 
 impl<T, B> ConnTask<T, B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     fn new(
@@ -437,7 +469,10 @@ where
 
 impl<T, B> Future for ConnTask<T, B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef + 'static,
 {
     type Output = ();
@@ -476,7 +511,10 @@ pin_project! {
         B: Unpin,
         B::Data: Send,
         B::Data: 'static,
-        B::Error: Into<BoxError>,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
         T: AsyncRead,
         T: AsyncWrite,
         T: Unpin,
@@ -500,7 +538,10 @@ pin_project! {
 
 impl<B, T> Future for H2ClientFuture<B, T>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef + 'static,
 {
     type Output = ();
@@ -518,7 +559,10 @@ where
 
 struct FutCtx<B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     is_connect: bool,
     // Extended CONNECT (RFC 8441): a `:protocol` tunnel.
@@ -528,17 +572,24 @@ where
     body_tx: SendStream<SendBuf<B::Data>>,
     body: B,
     allowed_trailers: Option<Arc<ForbiddenTrailers>>,
-    cb: Callback<Request<B>, Response<IncomingBody>>,
+    cb: Callback<Request<B>, Response<IncomingBody<B::Error>>, B::Error>,
 }
 
-impl<B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin> Unpin
-    for FutCtx<B>
+impl<
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
+> Unpin for FutCtx<B>
 {
 }
 
 pub(crate) struct ClientTask<B, T>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     ping: ping::Recorder,
@@ -549,14 +600,17 @@ where
     req_rx: ClientRx<B>,
     fut_ctx: Option<FutCtx<B>>,
     // The outcome, kept while the request queue drains.
-    closing: Option<crate::Result<Dispatched>>,
+    closing: Option<crate::Result<Dispatched, B::Error>>,
     admission: AdmissionOwner,
     marker: PhantomData<T>,
 }
 
 impl<B, T> ClientTask<B, T>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
@@ -594,7 +648,10 @@ pin_project! {
 
 impl<B> Future for PipeMap<B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     type Output = ();
 
@@ -668,7 +725,10 @@ where
 
 impl<B, T> ClientTask<B, T>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef,
 {
     #[expect(clippy::needless_pass_by_ref_mut)]
@@ -754,7 +814,10 @@ pin_project! {
         B: Unpin,
         B::Data: Send,
         B::Data: 'static,
-        B::Error: Into<BoxError>,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
     {
         #[pin]
         fut: ResponseFuture,
@@ -774,7 +837,10 @@ pin_project! {
 
 impl<B> ResponseFutMap<B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     /// Signal the `pipe_task` to reset the stream (e.g. on client cancellation).
     pub(crate) fn cancel(self: Pin<&mut Self>) {
@@ -786,9 +852,15 @@ where
 
 impl<B> Future for ResponseFutMap<B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
-    type Output = Result<Response<crate::body::Incoming>, (crate::Error, Option<Request<B>>)>;
+    type Output = Result<
+        Response<crate::body::Incoming<B::Error>>,
+        (crate::Error<B::Error>, Option<Request<B>>),
+    >;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.as_mut().project();
@@ -798,7 +870,7 @@ where
         let Some((ping, send_stream)) = this.ping.take().zip(this.send_stream.take()) else {
             return Poll::Ready(Err((
                 crate::Error::new_parse_internal()
-                    .with_display("ResponseFutMap polled twice (bug: polled after ready)"),
+                    .with(crate::StateFailure::ResponseAlreadyCompleted),
                 None::<Request<B>>,
             )));
         };
@@ -851,7 +923,8 @@ where
                 }
             }
             Err(err) => {
-                ping.ensure_not_timed_out().map_err(|e| (e, None))?;
+                ping.ensure_not_timed_out()
+                    .map_err(|e| (e.into_body_error(), None))?;
 
                 debug!("client response error: {err:?}");
                 Poll::Ready(Err((crate::Error::new_h2_request(err), None::<Request<B>>)))
@@ -862,10 +935,13 @@ where
 
 impl<B, T> ClientTask<B, T>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef,
 {
-    fn poll_dispatch(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<Dispatched>> {
+    fn poll_dispatch(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<Dispatched, B::Error>> {
         loop {
             match ready!(self.h2_tx.poll_ready(cx)) {
                 Ok(()) => (),
@@ -874,7 +950,9 @@ where
                     if let Some(f) = self.fut_ctx.take() {
                         self.poll_pipe(f, cx);
                     }
-                    self.ping.ensure_not_timed_out()?;
+                    self.ping
+                        .ensure_not_timed_out()
+                        .map_err(crate::Error::into_body_error)?;
                     return if err.reason() == Some(crate::h2::Reason::NO_ERROR) {
                         trace!("connection gracefully shutdown");
                         Poll::Ready(Ok(Dispatched::Shutdown))
@@ -986,10 +1064,13 @@ where
 
 impl<B, T> Future for ClientTask<B, T>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
     T: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef,
 {
-    type Output = crate::Result<Dispatched>;
+    type Output = crate::Result<Dispatched, B::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let result = match self.closing.take() {

@@ -149,10 +149,6 @@ fn combined_field_value(headers: &HeaderMap, name: &HeaderName) -> Bytes {
         .unwrap_or_default()
 }
 
-fn io_error(e: BoxError) -> std::io::Error {
-    std::io::Error::other(e)
-}
-
 /// Build a [`FastCgiClientRequest`] from an HTTP request **without** buffering
 /// the body. The request body is plumbed through as a [`FastCgiBody`] backed
 /// by the original [`Body`] stream.
@@ -284,7 +280,7 @@ pub(super) async fn http_request_to_fastcgi(
     }
 
     // ── Body: stream into FastCgiBody (no .collect) ─────────────────────
-    let body_stream = body.into_data_stream().map_err(io_error);
+    let body_stream = body.into_data_stream().map_err(std::io::Error::other);
     let body_reader = StreamReader::new(body_stream);
     let stdin = FastCgiBody::from_reader(body_reader);
 
@@ -551,7 +547,7 @@ pub(super) async fn http_response_to_fastcgi(resp: Response) -> Result<FastCgiRe
 
     // Chain header buffer with the streaming body.
     let header_reader = std::io::Cursor::new(header_buf.freeze());
-    let body_stream = body.into_data_stream().map_err(io_error);
+    let body_stream = body.into_data_stream().map_err(std::io::Error::other);
     let body_reader = StreamReader::new(body_stream);
     let chained = tokio::io::AsyncReadExt::chain(header_reader, body_reader);
 

@@ -1,15 +1,13 @@
 //! Error and Result module.
 
-use rama_core::error::BoxErrorExt as _;
 use std::error::Error as StdError;
-use std::fmt;
+use std::{convert::Infallible, fmt, io, sync::Arc};
 
 use crate::h2;
-use rama_core::error::{BoxError, ErrorExt as _};
 use rama_http_types as http;
 
 /// Result type often returned from methods that can have hyper `Error`s.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Infallible> = std::result::Result<T, Error<E>>;
 
 /// Represents errors that can occur handling HTTP streams.
 ///
@@ -25,24 +23,269 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// is unspecified. **You must not depend on it.** The wording and details may
 /// change in any version, with the goal of improving error messages.
 ///
-/// # Source
+/// # Causes
 ///
-/// A `rama_http_core::Error` may be caused by another error. To aid in debugging,
-/// those are exposed in `Error::source()` as erased types. While it is
-/// possible to check the exact type of the sources, they **can not be depended
-/// on**. They may come from private internal dependencies, and are subject to
-/// change at any moment.
-pub struct Error {
-    inner: Box<ErrorImpl>,
+/// Native protocol causes and the caller's body failure type remain available
+/// through [`Self::cause_ref`]. Rendering an error does not replace its evidence.
+pub struct Error<E = Infallible> {
+    inner: Box<ErrorImpl<E>>,
 }
 
-struct ErrorImpl {
+struct ErrorImpl<E> {
     kind: Kind,
-    cause: Option<BoxError>,
+    cause: Option<Cause<E>>,
+    preceding: Vec<Error<E>>,
 }
 
+/// The complete cause observed by the HTTP protocol owner.
 #[derive(Debug)]
-pub(super) enum Kind {
+pub enum Cause<E = Infallible> {
+    /// Reading, writing or finalizing the underlying byte stream failed.
+    Io(Arc<io::Error>),
+    /// The HTTP/2 peer or protocol rejected the operation.
+    Http2(Arc<h2::Error>),
+    /// The HTTP/3 protocol or its transport failed.
+    Http3(Arc<crate::h3::Error>),
+    /// Required transport finalization failed after an earlier protocol failure.
+    Finalization {
+        /// The complete failure that caused finalization to begin.
+        original: Arc<Error<E>>,
+        /// The native finalization failure.
+        cause: Arc<io::Error>,
+    },
+    /// An earlier HTTP failure caused this transition.
+    Http(Arc<Error<E>>),
+    /// The application-owned outgoing body failed.
+    Body(Arc<E>),
+    /// The protocol encountered an explicit state or lifecycle failure.
+    State(StateFailure),
+    /// A body ended before its declared content length.
+    IncompleteBody(IncompleteBody),
+    /// A native parser failure before protocol classification.
+    Parse(Arc<ParserError>),
+}
+
+/// Native failures encountered while decoding an HTTP message head.
+#[derive(Debug, Clone)]
+pub enum ParserError {
+    Http(httparse::Error),
+    Method(Arc<http::method::InvalidMethod>),
+    Status(Arc<http::status::InvalidStatusCode>),
+    Uri(rama_net::uri::ParseError),
+}
+
+impl ParserError {
+    fn classification(&self) -> Parse {
+        match self {
+            Self::Http(
+                httparse::Error::HeaderName
+                | httparse::Error::HeaderValue
+                | httparse::Error::NewLine
+                | httparse::Error::Token,
+            ) => Parse::Header(Header::Token),
+            Self::Http(httparse::Error::Status) | Self::Status(_) => Parse::Status,
+            Self::Http(httparse::Error::TooManyHeaders) => Parse::TooLarge,
+            Self::Http(httparse::Error::Version) => Parse::Version,
+            Self::Method(_) => Parse::Method,
+            Self::Uri(_) => Parse::Uri,
+        }
+    }
+}
+
+impl fmt::Display for ParserError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Http(cause) => cause.fmt(f),
+            Self::Method(cause) => cause.fmt(f),
+            Self::Status(cause) => cause.fmt(f),
+            Self::Uri(cause) => cause.fmt(f),
+        }
+    }
+}
+
+impl StdError for ParserError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(match self {
+            Self::Http(cause) => cause,
+            Self::Method(cause) => cause.as_ref(),
+            Self::Status(cause) => cause.as_ref(),
+            Self::Uri(cause) => cause,
+        })
+    }
+}
+
+/// A protocol state failure without an erased presentation-string cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateFailure {
+    ConnectionClosed,
+    ConnectionNotReady,
+    PeerSettingsUnavailable,
+    DispatchDropped { panicking: bool },
+    ClientConnectionConsumed,
+    ClientUpgradeConsumed,
+    ServerConnectionConsumed,
+    ServerUpgradeConsumed,
+    ClientPingUnavailable,
+    ServerPingUnavailable,
+    ResponseAlreadyCompleted,
+    SendCapacityClosed,
+    KeepAliveTimeout,
+    Timeout,
+}
+
+/// The remaining declared body length when an encoder observes early EOF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncompleteBody {
+    pub(crate) remaining: u64,
+}
+
+impl IncompleteBody {
+    /// Bytes still required by the declared content length.
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+}
+
+impl fmt::Display for IncompleteBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "early end, expected {} more bytes", self.remaining)
+    }
+}
+
+impl StdError for IncompleteBody {}
+
+impl fmt::Display for StateFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ConnectionClosed => "connection closed",
+            Self::ConnectionNotReady => "connection was not ready",
+            Self::PeerSettingsUnavailable => "connection closed before peer SETTINGS",
+            Self::DispatchDropped { panicking: true } => "dispatch dropped during unwinding",
+            Self::DispatchDropped { panicking: false } => "runtime dropped the dispatch task",
+            Self::ClientConnectionConsumed => "HTTP/1 client connection already consumed",
+            Self::ClientUpgradeConsumed => "HTTP/1 client upgrade already consumed",
+            Self::ServerConnectionConsumed => "HTTP/1 server connection already consumed",
+            Self::ServerUpgradeConsumed => "HTTP/1 server upgrade already consumed",
+            Self::ClientPingUnavailable => "HTTP/2 client ping channel unavailable",
+            Self::ServerPingUnavailable => "HTTP/2 server ping channel unavailable",
+            Self::SendCapacityClosed => "send stream capacity unexpectedly closed",
+            Self::ResponseAlreadyCompleted => "response future polled after completion",
+            Self::KeepAliveTimeout => "keep-alive timed out",
+            Self::Timeout => "operation timed out",
+        })
+    }
+}
+
+impl StdError for StateFailure {}
+
+impl<E> From<io::Error> for Cause<E> {
+    fn from(cause: io::Error) -> Self {
+        Self::Io(Arc::new(cause))
+    }
+}
+
+impl<E> From<h2::Error> for Cause<E> {
+    fn from(cause: h2::Error) -> Self {
+        Self::Http2(Arc::new(cause))
+    }
+}
+
+impl<E> From<crate::h3::Error> for Cause<E> {
+    fn from(cause: crate::h3::Error) -> Self {
+        Self::Http3(Arc::new(cause))
+    }
+}
+
+impl<E> From<Error<E>> for Cause<E> {
+    fn from(cause: Error<E>) -> Self {
+        Self::Http(Arc::new(cause))
+    }
+}
+
+impl<E> From<StateFailure> for Cause<E> {
+    fn from(cause: StateFailure) -> Self {
+        Self::State(cause)
+    }
+}
+
+impl<E> From<IncompleteBody> for Cause<E> {
+    fn from(cause: IncompleteBody) -> Self {
+        Self::IncompleteBody(cause)
+    }
+}
+
+impl<E> From<ParserError> for Cause<E> {
+    fn from(cause: ParserError) -> Self {
+        Self::Parse(Arc::new(cause))
+    }
+}
+
+impl<E> Clone for Cause<E> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Io(cause) => Self::Io(Arc::clone(cause)),
+            Self::Http2(cause) => Self::Http2(Arc::clone(cause)),
+            Self::Http3(cause) => Self::Http3(Arc::clone(cause)),
+            Self::Http(cause) => Self::Http(Arc::clone(cause)),
+            Self::Finalization { original, cause } => Self::Finalization {
+                original: Arc::clone(original),
+                cause: Arc::clone(cause),
+            },
+            Self::Body(cause) => Self::Body(Arc::clone(cause)),
+            Self::State(cause) => Self::State(*cause),
+            Self::IncompleteBody(cause) => Self::IncompleteBody(*cause),
+            Self::Parse(cause) => Self::Parse(Arc::clone(cause)),
+        }
+    }
+}
+
+impl<E> Clone for Error<E> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Box::new(ErrorImpl {
+                kind: self.inner.kind.clone(),
+                cause: self.inner.cause.clone(),
+                preceding: self.inner.preceding.clone(),
+            }),
+        }
+    }
+}
+
+impl Error {
+    /// Carry a protocol-only failure into a connection with an application body type.
+    pub fn into_body_error<E>(self) -> Error<E> {
+        Error {
+            inner: Box::new(ErrorImpl {
+                kind: self.inner.kind,
+                preceding: self
+                    .inner
+                    .preceding
+                    .into_iter()
+                    .map(Self::into_body_error)
+                    .collect(),
+                cause: self.inner.cause.map(|cause| match cause {
+                    Cause::Io(cause) => Cause::Io(cause),
+                    Cause::Http2(cause) => Cause::Http2(cause),
+                    Cause::Http3(cause) => Cause::Http3(cause),
+                    Cause::Http(cause) => {
+                        Cause::Http(Arc::new(cause.as_ref().clone().into_body_error()))
+                    }
+                    Cause::Body(cause) => match *cause {},
+                    Cause::Finalization { original, cause } => Cause::Finalization {
+                        original: Arc::new(original.as_ref().clone().into_body_error()),
+                        cause,
+                    },
+                    Cause::State(cause) => Cause::State(cause),
+                    Cause::IncompleteBody(cause) => Cause::IncompleteBody(cause),
+                    Cause::Parse(cause) => Cause::Parse(cause),
+                }),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Kind {
     Parse(Parse),
     User(User),
     /// A message reached EOF, but is not complete.
@@ -70,8 +313,8 @@ pub(super) enum Kind {
     Http2Refused,
 }
 
-#[derive(Debug)]
-pub(super) enum Parse {
+#[derive(Debug, Clone)]
+pub enum Parse {
     Method,
     Version,
     VersionH2,
@@ -81,24 +324,24 @@ pub(super) enum Parse {
     TooLarge,
     Status,
     Internal,
+    /// Preserves a native failure until the HTTP error constructor classifies it.
+    Native(ParserError),
 }
 
-#[derive(Debug)]
-pub(super) enum Header {
+#[derive(Debug, Clone)]
+pub enum Header {
     Token,
     ContentLengthInvalid,
     TransferEncodingInvalid,
     TransferEncodingUnexpected,
 }
 
-#[derive(Debug)]
-pub(super) enum User {
+#[derive(Debug, Clone)]
+pub enum User {
     /// Error calling the user's `Body::poll_data()`.
     Body,
     /// The user aborted writing of the outgoing body.
     BodyWriteAborted,
-    /// Error from future of user's Service.
-    Service,
     /// User tried to send a certain header in an unexpected context.
     ///
     /// For example, sending both `content-length` and `transfer-encoding`.
@@ -117,7 +360,21 @@ pub(super) enum User {
 #[derive(Debug)]
 pub(super) struct TimedOut;
 
-impl Error {
+impl<E> Error<E> {
+    /// Earlier failures observed before this terminal failure.
+    pub fn preceding(&self) -> &[Self] {
+        &self.inner.preceding
+    }
+
+    pub(super) fn preceded_by(mut self, earlier: Self) -> Self {
+        self.inner.preceding.push(earlier);
+        self
+    }
+    /// The concrete native or application cause, if the protocol observed one.
+    pub fn cause_ref(&self) -> Option<&Cause<E>> {
+        self.inner.cause.as_ref()
+    }
+
     /// Returns true if this was an HTTP parse error.
     ///
     /// This can be caused by a malformed HTTP message, an invalid header,
@@ -261,50 +518,80 @@ impl Error {
     #[inline(always)]
     #[must_use]
     pub fn is_timeout(&self) -> bool {
-        if matches!(self.inner.kind, Kind::HeaderTimeout) {
-            return true;
+        let mut current = self;
+        for _ in 0..64 {
+            if matches!(current.inner.kind, Kind::HeaderTimeout) {
+                return true;
+            }
+            match current.cause_ref() {
+                Some(Cause::State(StateFailure::Timeout | StateFailure::KeepAliveTimeout)) => {
+                    return true;
+                }
+                Some(Cause::Io(cause)) => return cause.kind() == io::ErrorKind::TimedOut,
+                Some(Cause::Http(cause)) => current = cause,
+                Some(Cause::Finalization { original, cause }) => {
+                    if cause.kind() == io::ErrorKind::TimedOut {
+                        return true;
+                    }
+                    current = original;
+                }
+                _ => return false,
+            }
         }
-        self.find_source::<TimedOut>().is_some()
+        false
     }
 
     #[inline(always)]
     pub(super) fn new(kind: Kind) -> Self {
         Self {
-            inner: Box::new(ErrorImpl { kind, cause: None }),
+            inner: Box::new(ErrorImpl {
+                kind,
+                cause: None,
+                preceding: Vec::new(),
+            }),
         }
     }
 
     #[inline(always)]
-    pub(super) fn with<C: Into<BoxError>>(mut self, cause: C) -> Self {
+    pub(super) fn with<C: Into<Cause<E>>>(mut self, cause: C) -> Self {
         self.inner.cause = Some(cause.into());
         self
     }
 
     #[inline(always)]
-    pub(super) fn with_display(
-        mut self,
-        msg: impl std::fmt::Display + std::fmt::Debug + Send + Sync + 'static,
-    ) -> Self {
-        self.inner.cause = Some(BoxError::from_static_str("http error cause").context(msg));
-        self
-    }
-
-    #[inline(always)]
-    pub(super) fn kind(&self) -> &Kind {
+    /// Protocol classification; native details remain in [`Self::cause_ref`].
+    pub fn kind(&self) -> &Kind {
         &self.inner.kind
     }
 
-    pub(crate) fn find_source<E: StdError + 'static>(&self) -> Option<&E> {
-        // Public predicates also inspect user-provided causes, which may cycle.
-        rama_core::error::error_chain(self.source()?).find_map(|error| error.downcast_ref())
+    pub(crate) fn find_source<T: StdError + 'static>(&self) -> Option<&T>
+    where
+        E: StdError + 'static,
+    {
+        rama_core::error::error_chain(self.source()?).find_map(|cause| cause.downcast_ref::<T>())
     }
 
-    pub(super) fn h2_reason(&self) -> h2::Reason {
-        // Find an h2::Reason somewhere in the cause stack, if it exists,
-        // otherwise assume an INTERNAL_ERROR.
-        self.find_source::<h2::Error>()
-            .and_then(|h2_err| h2_err.reason())
-            .unwrap_or(h2::Reason::INTERNAL_ERROR)
+    pub(super) fn with_finalization(self, cause: io::Error) -> Self {
+        Self::new(Kind::Shutdown).with(Cause::Finalization {
+            original: Arc::new(self),
+            cause: Arc::new(cause),
+        })
+    }
+
+    pub(super) fn h2_reason(&self) -> h2::Reason
+    where
+        E: StdError + 'static,
+    {
+        match self.cause_ref() {
+            Some(Cause::Http2(cause)) => cause.reason().unwrap_or(h2::Reason::INTERNAL_ERROR),
+            Some(Cause::Http(cause)) => cause.h2_reason(),
+            Some(Cause::Finalization { original, .. }) => original.h2_reason(),
+            Some(Cause::Body(_)) => self
+                .find_source::<h2::Error>()
+                .and_then(h2::Error::reason)
+                .unwrap_or(h2::Reason::INTERNAL_ERROR),
+            _ => h2::Reason::INTERNAL_ERROR,
+        }
     }
 
     #[inline(always)]
@@ -348,12 +635,12 @@ impl Error {
     }
 
     #[inline(always)]
-    pub(super) fn new_body<E: Into<BoxError>>(cause: E) -> Self {
+    pub(super) fn new_body<C: Into<Cause<E>>>(cause: C) -> Self {
         Self::new(Kind::Body).with(cause)
     }
 
     #[inline(always)]
-    pub(super) fn new_body_write<E: Into<BoxError>>(cause: E) -> Self {
+    pub(super) fn new_body_write<C: Into<Cause<E>>>(cause: C) -> Self {
         Self::new(Kind::BodyWrite).with(cause)
     }
 
@@ -388,13 +675,13 @@ impl Error {
     }
 
     #[inline(always)]
-    pub(super) fn new_user_service<E: Into<BoxError>>(cause: E) -> Self {
-        Self::new_user(User::Service).with(cause)
+    pub(super) fn new_user_service(cause: Infallible) -> Self {
+        match cause {}
     }
 
     #[inline(always)]
-    pub(super) fn new_user_body<E: Into<BoxError>>(cause: E) -> Self {
-        Self::new_user(User::Body).with(cause)
+    pub(super) fn new_user_body(cause: E) -> Self {
+        Self::new_user(User::Body).with(Cause::Body(Arc::new(cause)))
     }
 
     #[inline(always)]
@@ -449,6 +736,7 @@ impl Error {
             Kind::Parse(Parse::Internal) => {
                 "internal error inside rama_http_core and/or its dependencies, please report"
             }
+            Kind::Parse(Parse::Native(_)) => "native HTTP parser failure",
             Kind::IncompleteMessage => "connection closed before message completed",
             Kind::UnexpectedMessage => "received unexpected message from connection",
             Kind::ChannelClosed => "channel closed",
@@ -462,7 +750,6 @@ impl Error {
             Kind::Io => "connection error",
             Kind::User(User::Body) => "error from user's Body stream",
             Kind::User(User::BodyWriteAborted) => "user body write aborted",
-            Kind::User(User::Service) => "error from user's Service",
             Kind::User(User::UnexpectedHeader) => "user sent unexpected header",
             Kind::User(User::InvalidTarget) => "user sent an invalid request target",
             Kind::User(User::UnsupportedStatusCode) => {
@@ -473,36 +760,49 @@ impl Error {
     }
 }
 
-impl fmt::Debug for Error {
+impl<E: fmt::Debug> fmt::Debug for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut f = f.debug_tuple("rama_http_core::Error");
         f.field(&self.inner.kind);
         if let Some(cause) = &self.inner.cause {
             f.field(cause);
         }
+        if !self.inner.preceding.is_empty() {
+            f.field(&self.inner.preceding);
+        }
         f.finish()
     }
 }
 
-impl fmt::Display for Error {
+impl<E> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.description())
     }
 }
 
-impl StdError for Error {
+impl<E: StdError + 'static> StdError for Error<E> {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.inner
-            .cause
-            .as_ref()
-            .map(|cause| &**cause as &(dyn StdError + 'static))
+        self.cause_ref().map(|cause| match cause {
+            Cause::Io(cause) => cause.as_ref() as &(dyn StdError + 'static),
+            Cause::Http2(cause) => cause.as_ref(),
+            Cause::Http3(cause) => cause.as_ref(),
+            Cause::Http(cause) => cause.as_ref(),
+            Cause::Body(cause) => cause.as_ref(),
+            Cause::Finalization { original, .. } => original.as_ref(),
+            Cause::State(cause) => cause,
+            Cause::IncompleteBody(cause) => cause,
+            Cause::Parse(cause) => cause.as_ref(),
+        })
     }
 }
 
 #[doc(hidden)]
-impl From<Parse> for Error {
+impl<E> From<Parse> for Error<E> {
     fn from(err: Parse) -> Self {
-        Self::new(Kind::Parse(err))
+        match err {
+            Parse::Native(cause) => Self::new(Kind::Parse(cause.classification())).with(cause),
+            other => Self::new(Kind::Parse(other)),
+        }
     }
 }
 
@@ -522,33 +822,25 @@ impl Parse {
 
 impl From<httparse::Error> for Parse {
     fn from(err: httparse::Error) -> Self {
-        match err {
-            httparse::Error::HeaderName
-            | httparse::Error::HeaderValue
-            | httparse::Error::NewLine
-            | httparse::Error::Token => Self::Header(Header::Token),
-            httparse::Error::Status => Self::Status,
-            httparse::Error::TooManyHeaders => Self::TooLarge,
-            httparse::Error::Version => Self::Version,
-        }
+        Self::Native(ParserError::Http(err))
     }
 }
 
 impl From<http::method::InvalidMethod> for Parse {
-    fn from(_: http::method::InvalidMethod) -> Self {
-        Self::Method
+    fn from(cause: http::method::InvalidMethod) -> Self {
+        Self::Native(ParserError::Method(Arc::new(cause)))
     }
 }
 
 impl From<http::status::InvalidStatusCode> for Parse {
-    fn from(_: http::status::InvalidStatusCode) -> Self {
-        Self::Status
+    fn from(cause: http::status::InvalidStatusCode) -> Self {
+        Self::Native(ParserError::Status(Arc::new(cause)))
     }
 }
 
 impl From<rama_net::uri::ParseError> for Parse {
-    fn from(_: rama_net::uri::ParseError) -> Self {
-        Self::Uri
+    fn from(cause: rama_net::uri::ParseError) -> Self {
+        Self::Native(ParserError::Uri(cause))
     }
 }
 
@@ -567,67 +859,188 @@ mod tests {
     use super::*;
     use std::mem;
 
-    fn assert_send_sync<T: Send + Sync + 'static>() {}
+    #[test]
+    fn parser_failures_preserve_native_codes() -> std::result::Result<(), (httparse::Error, Error)>
+    {
+        for expected in [
+            httparse::Error::HeaderName,
+            httparse::Error::HeaderValue,
+            httparse::Error::NewLine,
+            httparse::Error::Token,
+            httparse::Error::Status,
+            httparse::Error::TooManyHeaders,
+            httparse::Error::Version,
+        ] {
+            let received = Error::from(Parse::from(expected));
+            if !matches!(received.cause_ref(), Some(Cause::Parse(cause))
+                if matches!(cause.as_ref(), ParserError::Http(actual) if *actual == expected))
+            {
+                return Err((expected, received));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parser_failure_retains_uri_offset_after_body_type_transition()
+    -> std::result::Result<(), std::result::Result<rama_net::uri::Uri, Error<BodyFailure>>> {
+        let native = match rama_net::uri::Uri::parse(b"/\xff".as_slice()) {
+            Ok(uri) => return Err(Ok(uri)),
+            Err(cause) => cause,
+        };
+        let error = Error::from(Parse::from(native.clone())).into_body_error::<BodyFailure>();
+        let preserves = matches!(error.kind(), Kind::Parse(Parse::Uri))
+            && matches!(error.cause_ref(), Some(Cause::Parse(cause))
+                if matches!(cause.as_ref(), ParserError::Uri(actual) if *actual == native));
+        preserves.then_some(()).ok_or(Err(error))
+    }
+
+    fn satisfies_send_sync<T: Send + Sync + 'static>() {}
 
     #[test]
     fn error_satisfies_send_sync() {
-        assert_send_sync::<Error>()
+        satisfies_send_sync::<Error>();
+        satisfies_send_sync::<Error<BodyFailure>>();
     }
 
     #[test]
-    fn error_size_of() {
-        assert_eq!(mem::size_of::<Error>(), mem::size_of::<usize>());
+    fn error_size_of() -> std::result::Result<(), (&'static str, usize, usize)> {
+        let expected = mem::size_of::<usize>();
+        let received = mem::size_of::<Error>();
+        (received == expected).then_some(()).ok_or((
+            "expected pointer size, received error handle size",
+            expected,
+            received,
+        ))
     }
 
-    #[test]
-    fn source_inspection_terminates_for_cyclic_causes() {
-        #[derive(Debug)]
-        struct Cycle;
+    #[derive(Debug)]
+    struct Cycle;
 
-        impl fmt::Display for Cycle {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("cycle")
-            }
+    impl fmt::Display for Cycle {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("cycle")
         }
+    }
 
-        impl StdError for Cycle {
-            fn source(&self) -> Option<&(dyn StdError + 'static)> {
-                Some(self)
-            }
+    impl StdError for Cycle {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            Some(self)
         }
-
-        let error = Error::new_canceled().with(Cycle);
-        assert!(!error.is_timeout());
-        assert_eq!(error.h2_reason(), h2::Reason::INTERNAL_ERROR);
     }
 
     #[test]
-    fn timeout_source_inspection_respects_depth_limit() {
-        let mut error = Error::new_canceled().with(TimedOut);
+    fn source_inspection_terminates_for_cyclic_causes()
+    -> std::result::Result<(), (&'static str, Error<Cycle>)> {
+        let error = Error::new_user_body(Cycle);
+        let valid = matches!(error.cause_ref(), Some(Cause::Body(_)))
+            && !error.is_timeout()
+            && error.h2_reason() == h2::Reason::INTERNAL_ERROR;
+        valid.then_some(()).ok_or((
+            "cyclic application source remains concrete and inspection terminates",
+            error,
+        ))
+    }
+
+    #[test]
+    fn timeout_source_inspection_respects_depth_limit()
+    -> std::result::Result<(), (&'static str, Error, Error)> {
+        let mut error: Error = Error::new_canceled().with(StateFailure::Timeout);
         for _ in 0..63 {
             error = Error::new_canceled().with(error);
         }
-        assert!(error.is_timeout());
-        assert!(!Error::new_canceled().with(error).is_timeout());
+        let nested = Error::new_canceled().with(error.clone());
+        let valid = error.is_timeout()
+            && !nested.is_timeout()
+            && matches!(nested.cause_ref(), Some(Cause::Http(_)));
+        valid.then_some(()).ok_or((
+            "bounded classification preserves both complete cause chains",
+            error,
+            nested,
+        ))
     }
 
     #[test]
-    fn h2_reason_unknown() {
-        let closed = Error::new_closed();
-        assert_eq!(closed.h2_reason(), h2::Reason::INTERNAL_ERROR);
+    fn h2_reason_unknown() -> std::result::Result<(), (&'static str, Error)> {
+        let error: Error = Error::new_closed();
+        let valid = error.h2_reason() == h2::Reason::INTERNAL_ERROR && error.cause_ref().is_none();
+        valid.then_some(()).ok_or((
+            "closed channel must not fabricate an HTTP/2 peer reason",
+            error,
+        ))
     }
 
     #[test]
-    fn h2_reason_one_level() {
-        let body_err = Error::new_user_body(h2::Error::from(h2::Reason::ENHANCE_YOUR_CALM));
-        assert_eq!(body_err.h2_reason(), h2::Reason::ENHANCE_YOUR_CALM);
+    fn h2_reason_one_level() -> std::result::Result<(), (&'static str, Error<h2::Error>)> {
+        let error = Error::new_user_body(h2::Error::from(h2::Reason::ENHANCE_YOUR_CALM));
+        let valid = matches!(error.cause_ref(), Some(Cause::Body(cause)) if cause.reason() == Some(h2::Reason::ENHANCE_YOUR_CALM))
+            && error.h2_reason() == h2::Reason::ENHANCE_YOUR_CALM;
+        valid
+            .then_some(())
+            .ok_or(("preserve the application's HTTP/2 cause and reason", error))
     }
 
     #[test]
-    fn h2_reason_nested() {
-        let recvd = Error::new_h2(h2::Error::from(h2::Reason::HTTP_1_1_REQUIRED));
-        // Suppose a user were proxying the received error
-        let svc_err = Error::new_user_service(recvd);
-        assert_eq!(svc_err.h2_reason(), h2::Reason::HTTP_1_1_REQUIRED);
+    fn h2_reason_nested() -> std::result::Result<(), (&'static str, Error<Error>)> {
+        let received: Error = Error::new_h2(h2::Error::from(h2::Reason::HTTP_1_1_REQUIRED));
+        let error = Error::new_user_body(received);
+        let valid = matches!(error.cause_ref(), Some(Cause::Body(cause)) if matches!(cause.cause_ref(), Some(Cause::Http2(_))))
+            && error.h2_reason() == h2::Reason::HTTP_1_1_REQUIRED;
+        valid
+            .then_some(())
+            .ok_or(("forwarded native cause retains its peer reason", error))
+    }
+
+    #[test]
+    fn native_io_cause_is_available_without_downcasting()
+    -> std::result::Result<(), (&'static str, Error)> {
+        let error: Error = Error::new_io(io::Error::from(io::ErrorKind::ConnectionReset));
+        let valid = matches!(error.cause_ref(), Some(Cause::Io(cause)) if cause.kind() == io::ErrorKind::ConnectionReset);
+        valid
+            .then_some(())
+            .ok_or(("retain the native I/O value", error))
+    }
+
+    #[test]
+    fn finalization_preserves_original_and_shutdown_failures()
+    -> std::result::Result<(), (&'static str, Error)> {
+        let original: Error = Error::new_io(io::Error::from(io::ErrorKind::ConnectionReset));
+        let error = original.with_finalization(io::Error::from(io::ErrorKind::BrokenPipe));
+        let valid = matches!(error.cause_ref(), Some(Cause::Finalization { original, cause })
+            if cause.kind() == io::ErrorKind::BrokenPipe
+                && matches!(original.cause_ref(), Some(Cause::Io(cause)) if cause.kind() == io::ErrorKind::ConnectionReset));
+        valid.then_some(()).ok_or((
+            "shutdown failure cannot erase the original connection failure",
+            error,
+        ))
+    }
+
+    #[derive(Debug)]
+    struct BodyFailure {
+        received: Vec<u8>,
+    }
+
+    impl fmt::Display for BodyFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "body failed after {} bytes", self.received.len())
+        }
+    }
+
+    impl StdError for BodyFailure {}
+
+    #[test]
+    fn application_body_payload_survives_shared_reporting()
+    -> std::result::Result<(), (&'static str, Error<BodyFailure>, Error<BodyFailure>)> {
+        let error = Error::new_user_body(BodyFailure {
+            received: b"prefix".to_vec(),
+        });
+        let shared = error.clone();
+        let valid = matches!((error.cause_ref(), shared.cause_ref()), (Some(Cause::Body(first)), Some(Cause::Body(second)))
+            if Arc::ptr_eq(first, second) && first.received == b"prefix");
+        valid.then_some(()).ok_or((
+            "independent observers retain the same concrete body failure",
+            error,
+            shared,
+        ))
     }
 }

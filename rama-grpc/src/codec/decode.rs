@@ -257,7 +257,7 @@ impl StreamingInner {
         let frame = match ready!(Pin::new(self.body.get_mut()).poll_frame(cx)) {
             Some(Ok(frame)) => frame,
             Some(Err(err)) => {
-                let status = Status::from_error(err);
+                let status = Status::from_error_generic(err);
 
                 if self.direction == Direction::Request && status.code() == Code::Cancelled {
                     return Poll::Ready(Ok(None));

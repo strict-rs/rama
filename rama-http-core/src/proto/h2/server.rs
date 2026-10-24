@@ -9,7 +9,6 @@ use pin_project_lite::pin_project;
 use rama_core::{
     Service,
     bytes::Bytes,
-    error::BoxError,
     extensions::ExtensionsRef,
     rt::Executor,
     telemetry::tracing::{Instrument, debug, trace, trace_root_span, warn},
@@ -112,7 +111,7 @@ struct ResponseOptions {
 pin_project! {
     pub(crate) struct Server<T, S>
     where
-        S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>
+        S: Service<Request<IncomingBody<rama_core::error::ArcError>>, Output = Response, Error = Infallible>
     {
         exec: Executor,
         service: S,
@@ -157,7 +156,11 @@ enum Closing {
 impl<T, S> Server<T, S>
 where
     T: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+    S: Service<
+            Request<IncomingBody<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        >,
 {
     pub(crate) fn new(
         io: T,
@@ -237,7 +240,11 @@ where
 impl<T, S> Future for Server<T, S>
 where
     T: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+    S: Service<
+            Request<IncomingBody<rama_core::error::ArcError>>,
+            Output = Response,
+            Error = Infallible,
+        > + Clone,
 {
     type Output = crate::Result<Dispatched>;
 
@@ -271,10 +278,8 @@ where
                     me.timer.mark_busy();
                     let ping = if ping_config.is_enabled() {
                         let Some(pp) = conn.ping_pong() else {
-                            return Poll::Ready(Err(
-                                crate::Error::new_parse_internal()
-                                    .with_display("bug: report in rama crate: server: conn.ping_pong not available while ping config is enabled"),
-                            ));
+                            return Poll::Ready(Err(crate::Error::new_parse_internal()
+                                .with(crate::StateFailure::ServerPingUnavailable)));
                         };
                         Some(ping::channel(pp, ping_config))
                     } else {
@@ -315,7 +320,11 @@ where
         timer: &mut ConnTimer,
     ) -> Poll<crate::Result<()>>
     where
-        S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+        S: Service<
+                Request<IncomingBody<rama_core::error::ArcError>>,
+                Output = Response,
+                Error = Infallible,
+            > + Clone,
     {
         loop {
             self.poll_ping(cx, timer);
@@ -522,7 +531,10 @@ pin_project! {
         B: Unpin,
         B::Data: Send,
         B::Data: 'static,
-        B::Error: Into<BoxError>,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
     {
         reply: SendResponse<SendBuf<B::Data>>,
         #[pin]
@@ -543,7 +555,10 @@ pin_project! {
         B: Unpin,
         B::Data: Send,
         B::Data: 'static,
-        B::Error: Into<BoxError>,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
     {
         Service {
             #[pin]
@@ -566,7 +581,10 @@ struct ConnectParts {
 
 impl<F, B> H2Stream<F, B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     fn new(
         fut: F,
@@ -599,13 +617,15 @@ macro_rules! reply {
     }};
 }
 
-impl<F, B, E> H2Stream<F, B>
+impl<F, B> H2Stream<F, B>
 where
-    F: Future<Output = Result<Response<B>, E>>,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
-    E: Into<BoxError>,
+    F: Future<Output = Result<Response<B>, Infallible>>,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
-    fn poll2(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    fn poll2(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<crate::Result<(), B::Error>> {
         let mut me = self.as_mut().project();
         loop {
             let next = match me.state.as_mut().project() {
@@ -742,11 +762,13 @@ where
     }
 }
 
-impl<F, B, E> Future for H2Stream<F, B>
+impl<F, B> Future for H2Stream<F, B>
 where
-    F: Future<Output = Result<Response<B>, E>>,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
-    E: Into<BoxError>,
+    F: Future<Output = Result<Response<B>, Infallible>>,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     type Output = ();
 

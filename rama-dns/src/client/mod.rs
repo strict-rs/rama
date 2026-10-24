@@ -1,6 +1,8 @@
 pub mod resolver;
 
 mod in_flight;
+#[doc(inline)]
+pub use in_flight::LookupTaskError;
 
 mod limit;
 #[doc(inline)]
@@ -21,8 +23,8 @@ pub use self::hickory::HickoryDnsResolver;
 mod tokio;
 #[doc(inline)]
 pub use self::tokio::{
-    TokioDnsCnameUnsupportedError, TokioDnsResolver, TokioDnsServiceBindingUnsupportedError,
-    TokioDnsTxtUnsupportedError,
+    TokioDnsCnameUnsupportedError, TokioDnsResolver, TokioDnsResolverError,
+    TokioDnsServiceBindingUnsupportedError, TokioDnsTxtUnsupportedError,
 };
 
 #[cfg(target_vendor = "apple")]

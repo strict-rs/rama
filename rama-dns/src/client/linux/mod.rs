@@ -40,7 +40,7 @@ use rama_utils::{
 use tokio::time::Instant;
 
 use super::{
-    in_flight::{self, InFlight, Outcome},
+    in_flight::{self, Outcome, RecordFlights, SharedRecord},
     limit::{DnsTimeoutError, Limits, LookupLimit},
     resolver::{
         DnsAddressResolver, DnsCnameResolver, DnsResolver, DnsServiceBindingResolver,
@@ -292,7 +292,7 @@ impl LinuxDnsResolverBuilder {
                 self.cache_ttl,
                 self.negative_cache_ttl,
             )),
-            in_flight: InFlight::default(),
+            in_flight: RecordFlights::default(),
             systemd_resolved: self
                 .systemd_resolved
                 .then(|| Arc::new(SystemdResolved::new(self.systemd_resolved_config))),
@@ -349,7 +349,7 @@ pub struct LinuxDnsResolver {
     cache_capacity: u64,
     native: NativeConfig,
     cache: Arc<cache::LinuxDnsCache>,
-    in_flight: InFlight<cache::CacheKey>,
+    in_flight: RecordFlights<cache::CacheKey>,
     systemd_resolved: Option<Arc<SystemdResolved>>,
 }
 
@@ -425,7 +425,7 @@ impl LinuxDnsResolver {
         /// this call no longer share lookups with this resolver.
         pub fn timeout(mut self, timeout: Duration) -> Self {
             self.timeout = timeout;
-            self.in_flight = InFlight::default();
+            self.in_flight = RecordFlights::default();
             self
         }
     }
@@ -655,14 +655,14 @@ fn lookup_cached_stream<T, S, G, I, F>(
     domain: Domain,
     timeout: Duration,
     cache: Arc<cache::LinuxDnsCache>,
-    in_flight: InFlight<cache::CacheKey>,
+    in_flight: RecordFlights<cache::CacheKey>,
     kind: cache::RecordKind,
     get_cached: G,
     insert_cached: I,
     lookup: F,
 ) -> impl Stream<Item = Result<T, BoxError>> + Send
 where
-    T: Clone + Send + Sync + 'static,
+    T: SharedRecord,
     S: Stream<Item = Result<LookupEvent<T>, BoxError>> + Send + 'static,
     G: Fn(&cache::LinuxDnsCache, &Domain) -> Option<cache::CacheLookup<T>> + Send + 'static,
     I: Fn(&cache::LinuxDnsCache, Domain, Vec<T>, Option<Duration>) + Send + 'static,
@@ -690,6 +690,7 @@ where
 
         // a native fallback after a failed varlink attempt gets a second budget
         let outcome = in_flight
+            .for_record::<T>()
             .run(
                 cache::CacheKey::new(domain.clone(), kind),
                 timeout.saturating_mul(2),
@@ -1161,7 +1162,7 @@ static_str_error! {
 #[cfg(test)]
 mod tests {
     use super::{
-        DnsAddressResolver as _, InFlight, Limits, LookupEvent, LookupLimit, NativeConfig,
+        DnsAddressResolver as _, Limits, LookupEvent, LookupLimit, NativeConfig, RecordFlights,
         ResolvedLookup, cache, dns_name_from_domain, in_flight, lookup_and_cache,
         lookup_cached_stream, native_lookup_ipv4_stream, resolved_first_stream,
     };
@@ -1240,7 +1241,7 @@ mod tests {
             domain,
             Duration::from_secs(5),
             cache,
-            InFlight::default(),
+            RecordFlights::default(),
             cache::RecordKind::Ipv4,
             move |cache, domain| cache.get_ipv4(domain),
             move |cache, domain, values, ttl| cache.insert_ipv4(domain, values, ttl),
@@ -1308,7 +1309,7 @@ mod tests {
             domain,
             Duration::from_secs(5),
             cache,
-            InFlight::default(),
+            RecordFlights::default(),
             kind.record_kind(),
             move |cache, domain| kind.get(cache, domain),
             move |cache, domain, values, ttl| kind.insert(cache, domain, values, ttl),
@@ -1328,7 +1329,7 @@ mod tests {
             domain,
             Duration::from_secs(5),
             cache,
-            InFlight::default(),
+            RecordFlights::default(),
             cache::RecordKind::Txt,
             move |cache, domain| cache.get_txt(domain),
             move |cache, domain, values, ttl| cache.insert_txt(domain, values, ttl),
@@ -1540,7 +1541,10 @@ mod tests {
         let resolver = super::LinuxDnsResolver::builder()
             .with_systemd_resolved(false)
             .build();
-        assert_eq!(resolver.in_flight.abandoned(), in_flight::Abandoned::Finish);
+        assert_eq!(
+            resolver.in_flight.for_record::<Ipv4Addr>().abandoned(),
+            in_flight::Abandoned::Finish
+        );
     }
 
     #[test]
@@ -1646,7 +1650,7 @@ mod tests {
     fn gated_ipv4_stream(
         domain: Domain,
         cache: Arc<cache::LinuxDnsCache>,
-        in_flight: InFlight<cache::CacheKey>,
+        in_flight: RecordFlights<cache::CacheKey>,
         lookups: Arc<AtomicUsize>,
         gate: Arc<Notify>,
         answer: Result<(Ipv4Addr, u32), &'static str>,
@@ -1681,7 +1685,7 @@ mod tests {
         let addr = Ipv4Addr::new(192, 0, 2, 7);
         // a zero TTL is never cached, yet concurrent callers still share
         for wire_ttl in [60, 0] {
-            let (cache, in_flight) = (test_cache(), InFlight::default());
+            let (cache, in_flight) = (test_cache(), RecordFlights::default());
             let lookups = Arc::new(AtomicUsize::new(0));
             let gate = Arc::new(Notify::new());
 
@@ -1708,7 +1712,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_names_and_kinds_do_not_share() {
-        let (cache, in_flight) = (test_cache(), InFlight::default());
+        let (cache, in_flight) = (test_cache(), RecordFlights::default());
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
         let other: Domain = "other.example.".try_into().expect("valid domain");
@@ -1750,7 +1754,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_failure_reaches_every_caller_and_is_not_sticky() {
-        let (cache, in_flight) = (test_cache(), InFlight::default());
+        let (cache, in_flight) = (test_cache(), RecordFlights::default());
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
 
@@ -1800,7 +1804,7 @@ mod tests {
             test_domain(),
             timeout,
             test_cache(),
-            InFlight::default(),
+            RecordFlights::default(),
             cache::RecordKind::Ipv4,
             move |cache, domain| cache.get_ipv4(domain),
             move |cache, domain, values, ttl| cache.insert_ipv4(domain, values, ttl),
@@ -1823,7 +1827,7 @@ mod tests {
 
     #[tokio::test]
     async fn leading_dot_name_is_refused_before_sharing() {
-        let (cache, in_flight) = (test_cache(), InFlight::default());
+        let (cache, in_flight) = (test_cache(), RecordFlights::default());
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
 
@@ -1852,7 +1856,7 @@ mod tests {
 
     #[tokio::test]
     async fn rooted_and_relative_names_do_not_share() {
-        let (cache, in_flight) = (test_cache(), InFlight::default());
+        let (cache, in_flight) = (test_cache(), RecordFlights::default());
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
         let relative: Domain = "intranet".try_into().expect("valid domain");
@@ -1890,7 +1894,7 @@ mod tests {
 
     #[tokio::test]
     async fn abandoned_lookup_still_completes_and_caches() {
-        let (cache, in_flight) = (test_cache(), InFlight::default());
+        let (cache, in_flight) = (test_cache(), RecordFlights::default());
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
         let addr = Ipv4Addr::new(192, 0, 2, 9);
@@ -1969,7 +1973,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_authoritative_negative_is_shared_and_cached() {
-        let (cache, in_flight) = (test_cache(), InFlight::default());
+        let (cache, in_flight) = (test_cache(), RecordFlights::default());
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
 

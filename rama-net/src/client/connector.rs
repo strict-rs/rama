@@ -11,11 +11,7 @@ use crate::{
 use rama_core::{
     error::{BoxError, BoxErrorExt as _},
     extensions::Extensions,
-    futures::{
-        Stream, StreamExt as _,
-        stream::{BoxStream, FuturesUnordered},
-    },
-    telemetry::tracing,
+    futures::{Stream, stream::BoxStream},
 };
 use rama_macros::Extension;
 
@@ -97,7 +93,7 @@ impl core::fmt::Debug for ConnectorTargetStream {
 /// [`ConnectorTargetStream`]), keeps up to `max_in_flight` dials racing
 /// concurrently via `dial`, and returns the first successful connection together
 /// with the address it connected to. If every candidate fails (to resolve or to
-/// connect), the last error is returned.
+/// connect), the last error is returned. Use [`super::ConnectionRace`] to retain earlier failures, abandoned dials and cancellation progress.
 pub async fn race_connect<S, C, F, Fut>(
     candidates: S,
     max_in_flight: usize,
@@ -109,64 +105,20 @@ where
     Fut: Future<Output = Result<C, BoxError>> + Send,
     C: Send,
 {
-    let max_in_flight = max_in_flight.max(1);
-
-    let dial = &dial;
-    let mut candidates = std::pin::pin!(candidates);
-    let mut in_flight = FuturesUnordered::new();
-    let mut candidates_done = false;
-    let mut last_err: Option<BoxError> = None;
-
-    enum Event<C> {
-        Candidate(Option<Result<SocketAddr, BoxError>>),
-        Dialed(Option<(SocketAddr, Result<C, BoxError>)>),
+    let max_in_flight =
+        std::num::NonZeroUsize::new(max_in_flight).unwrap_or(std::num::NonZeroUsize::MIN);
+    match super::ConnectionRace::new(candidates, max_in_flight, std::num::NonZeroUsize::MAX, dial)
+        .await
+    {
+        Ok(connected) => Ok((connected.address, connected.connection)),
+        Err(mut failure) => Err(match failure.receipt.failures.pop() {
+            Some(
+                super::RaceAttemptFailure::Resolution(cause)
+                | super::RaceAttemptFailure::Dial { cause, .. },
+            ) => cause,
+            None => BoxError::from_static_str("race_connect: no connection candidates"),
+        }),
     }
-
-    loop {
-        if candidates_done && in_flight.is_empty() {
-            break;
-        }
-
-        let event = if !candidates_done && in_flight.len() < max_in_flight {
-            if in_flight.is_empty() {
-                Event::Candidate(candidates.next().await)
-            } else {
-                tokio::select! {
-                    candidate = candidates.next() => Event::Candidate(candidate),
-                    dialed = in_flight.next() => Event::Dialed(dialed),
-                }
-            }
-        } else {
-            Event::Dialed(in_flight.next().await)
-        };
-
-        match event {
-            Event::Candidate(Some(Ok(addr))) => {
-                tracing::trace!(%addr, "race connect: dial candidate");
-                in_flight.push(async move { (addr, dial(addr).await) });
-            }
-            Event::Candidate(Some(Err(err))) => {
-                tracing::debug!(error = %err, "race connect: candidate failed");
-                last_err = Some(err);
-            }
-            Event::Candidate(None) => {
-                tracing::trace!(in_flight = in_flight.len(), "race connect: candidates done");
-                candidates_done = true;
-            }
-            Event::Dialed(Some((addr, Ok(conn)))) => {
-                tracing::trace!(%addr, "race connect: connected");
-                return Ok((addr, conn));
-            }
-            Event::Dialed(Some((addr, Err(err)))) => {
-                tracing::debug!(%addr, error = %err, "race connect: dial failed");
-                last_err = Some(err);
-            }
-            Event::Dialed(None) => {}
-        }
-    }
-
-    Err(last_err
-        .unwrap_or_else(|| BoxError::from_static_str("race_connect: no connection candidates")))
 }
 
 #[cfg(test)]

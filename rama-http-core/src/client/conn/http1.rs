@@ -20,12 +20,15 @@ use crate::body::Incoming as IncomingBody;
 use crate::client::dispatch::{self, TrySendError};
 use crate::proto;
 
+mod session;
+pub use session::{ExchangeOutcome, ExchangePhase, Session, SessionTermination};
+
 type Dispatcher<T, B> =
     proto::dispatch::Dispatcher<proto::dispatch::Client<B>, B, T, proto::h1::ClientTransaction>;
 
 /// The sender side of an established connection.
-pub struct SendRequest<B> {
-    dispatch: dispatch::Sender<Request<B>, Response<IncomingBody>>,
+pub struct SendRequest<B: StreamingBody> {
+    dispatch: dispatch::Sender<Request<B>, Response<IncomingBody<B::Error>>, B::Error>,
 }
 
 /// Deconstructed parts of a `Connection`.
@@ -65,7 +68,10 @@ pub struct Parts<T> {
 pub struct Connection<T, B>
 where
     T: AsyncRead + AsyncWrite,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     inner: Dispatcher<T, B>,
 }
@@ -73,7 +79,10 @@ where
 impl<T, B> Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     /// Return the inner IO object, and additional information.
     ///
@@ -94,7 +103,10 @@ where
     /// Use [`poll_fn`](https://docs.rs/futures/0.1.25/futures/future/fn.poll_fn.html)
     /// and [`try_ready!`](https://docs.rs/futures/0.1.25/futures/macro.try_ready.html)
     /// to work with this function; or use the `without_shutdown` wrapper.
-    pub fn poll_without_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    pub fn poll_without_shutdown(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<crate::Result<(), B::Error>> {
         self.inner.poll_without_shutdown(cx)
     }
 
@@ -104,19 +116,19 @@ where
     /// # Errors
     ///
     /// Returns an error if the connection encounters an error while being polled to completion.
-    pub async fn without_shutdown(self) -> crate::Result<Parts<T>> {
+    pub async fn without_shutdown(self) -> crate::Result<Parts<T>, B::Error> {
         let mut this = Some(self);
-        std::future::poll_fn(move |cx| -> Poll<crate::Result<Parts<T>>> {
+        std::future::poll_fn(move |cx| -> Poll<crate::Result<Parts<T>, B::Error>> {
             if let Some(conn) = this.as_mut() {
                 ready!(conn.poll_without_shutdown(cx))?;
                 #[expect(clippy::expect_used, reason = "memory cannot move in between polls")]
-                let conn = this.take().expect("inner h1 connection for without shutdown was Some above");
+                let conn = this
+                    .take()
+                    .expect("inner h1 connection for without shutdown was Some above");
                 Poll::Ready(Ok(conn.into_parts()))
             } else {
-                Poll::Ready(Err(
-                    crate::Error::new_parse_internal().with_display(
-                        "h1 client connection w/o shutdown: poll: inner connection already taken: poll after ready?",
-                    )))
+                Poll::Ready(Err(crate::Error::new_parse_internal()
+                    .with(crate::StateFailure::ClientConnectionConsumed)))
             }
         })
         .await
@@ -150,21 +162,24 @@ pub struct Builder {
 /// # Errors
 ///
 /// Returns an error if the HTTP/1 connection handshake fails.
-pub async fn handshake<T, B>(io: T) -> crate::Result<(SendRequest<B>, Connection<T, B>)>
+pub async fn handshake<T, B>(io: T) -> crate::Result<(SendRequest<B>, Connection<T, B>), B::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     Builder::new().handshake(io).await
 }
 
 // ===== impl SendRequest
 
-impl<B> SendRequest<B> {
+impl<B: StreamingBody> SendRequest<B> {
     /// Polls to determine whether this sender can be used yet for a request.
     ///
     /// If the associated connection is closed, this returns an Error.
-    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<(), B::Error>> {
         self.dispatch.poll_ready(cx)
     }
 
@@ -173,7 +188,7 @@ impl<B> SendRequest<B> {
     /// # Errors
     ///
     /// If the associated connection is closed, this returns an Error.
-    pub async fn ready(&mut self) -> crate::Result<()> {
+    pub async fn ready(&mut self) -> crate::Result<(), B::Error> {
         std::future::poll_fn(|cx| self.poll_ready(cx)).await
     }
 
@@ -196,7 +211,10 @@ impl<B> SendRequest<B> {
 
 impl<B> SendRequest<B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     /// Sends a `Request` on the associated connection.
     ///
@@ -230,7 +248,8 @@ where
     pub fn send_request(
         &mut self,
         req: Request<B>,
-    ) -> impl Future<Output = crate::Result<Response<IncomingBody>>> + use<B> {
+    ) -> impl Future<Output = crate::Result<Response<IncomingBody<B::Error>>, B::Error>> + use<B>
+    {
         let sent = self.dispatch.send(req);
 
         async move {
@@ -243,7 +262,7 @@ where
                 },
                 Err(_req) => {
                     debug!("connection was not ready");
-                    Err(crate::Error::new_canceled().with("connection was not ready"))
+                    Err(crate::Error::new_canceled().with(crate::StateFailure::ConnectionNotReady))
                 }
             }
         }
@@ -260,7 +279,8 @@ where
     pub fn try_send_request(
         &mut self,
         req: Request<B>,
-    ) -> impl Future<Output = Result<Response<IncomingBody>, TrySendError<Request<B>>>> {
+    ) -> impl Future<Output = Result<Response<IncomingBody<B::Error>>, TrySendError<Request<B>, B::Error>>>
+    {
         let sent = self.dispatch.try_send(req);
         async move {
             match sent {
@@ -272,7 +292,8 @@ where
                 },
                 Err(req) => {
                     debug!("connection was not ready");
-                    let error = crate::Error::new_canceled().with("connection was not ready");
+                    let error =
+                        crate::Error::new_canceled().with(crate::StateFailure::ConnectionNotReady);
                     Err(TrySendError {
                         error,
                         message: Some(req),
@@ -283,7 +304,7 @@ where
     }
 }
 
-impl<B> fmt::Debug for SendRequest<B> {
+impl<B: StreamingBody> fmt::Debug for SendRequest<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SendRequest").finish()
     }
@@ -294,7 +315,10 @@ impl<B> fmt::Debug for SendRequest<B> {
 impl<T, B> Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     /// Enable this connection to support higher-level HTTP upgrades.
     pub fn with_upgrades(self) -> upgrades::UpgradeableConnection<T, B> {
@@ -305,7 +329,10 @@ where
 impl<T, B> fmt::Debug for Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + fmt::Debug,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection").finish()
@@ -315,9 +342,12 @@ where
 impl<T, B> Future for Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
-    type Output = crate::Result<()>;
+    type Output = crate::Result<(), B::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match ready!(Pin::new(&mut self.inner).poll(cx))? {
@@ -564,10 +594,13 @@ impl Builder {
     pub fn handshake<T, B>(
         &self,
         io: T,
-    ) -> impl Future<Output = crate::Result<(SendRequest<B>, Connection<T, B>)>>
+    ) -> impl Future<Output = crate::Result<(SendRequest<B>, Connection<T, B>), B::Error>>
     where
         T: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
-        B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + 'static
+            + Unpin,
     {
         let opts = self.clone();
 
@@ -614,6 +647,19 @@ impl Builder {
             Ok((SendRequest { dispatch: tx }, Connection { inner: proto }))
         }
     }
+
+    /// Establish a sender and driver under one owner, without spawning a background task.
+    pub async fn handshake_session<T, B>(&self, io: T) -> crate::Result<Session<T, B>, B::Error>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + 'static
+            + Unpin,
+    {
+        let (sender, connection) = self.handshake(io).await?;
+        Ok(Session::new(sender, connection))
+    }
 }
 
 mod upgrades {
@@ -629,7 +675,10 @@ mod upgrades {
     pub struct UpgradeableConnection<T, B>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + 'static
+            + Unpin,
     {
         pub(super) inner: Option<Connection<T, B>>,
     }
@@ -637,9 +686,12 @@ mod upgrades {
     impl<I, B> Future for UpgradeableConnection<I, B>
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef + 'static,
-        B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + 'static
+            + Unpin,
     {
-        type Output = crate::Result<()>;
+        type Output = crate::Result<(), B::Error>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             Poll::Ready(if let Some(inner) = self.inner.as_mut() {
@@ -668,10 +720,8 @@ mod upgrades {
                     Err(e) => Err(e),
                 }
             } else {
-                Err(
-                    crate::Error::new_parse_internal().with_display(
-                        "h1 client upgradeable connection: poll: inner connection already taken: poll after ready?",
-                    ))
+                Err(crate::Error::new_parse_internal()
+                    .with(crate::StateFailure::ClientUpgradeConsumed))
             })
         }
     }

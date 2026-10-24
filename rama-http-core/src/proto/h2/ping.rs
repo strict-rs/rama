@@ -241,7 +241,7 @@ impl Recorder {
         if let Some(shared) = &self.shared {
             let locked = shared.lock();
             if locked.is_keep_alive_timed_out {
-                return Err(KeepAliveTimedOut.crate_error());
+                return Err(crate::Error::from(KeepAliveTimedOut));
             }
         }
 
@@ -507,9 +507,9 @@ impl KeepAlive {
 
 // ===== impl KeepAliveTimedOut =====
 
-impl KeepAliveTimedOut {
-    pub(super) fn crate_error(self) -> crate::Error {
-        crate::Error::new(crate::error::Kind::Http2).with(self)
+impl From<KeepAliveTimedOut> for crate::Error {
+    fn from(KeepAliveTimedOut: KeepAliveTimedOut) -> Self {
+        Self::new(crate::error::Kind::Http2).with(crate::StateFailure::KeepAliveTimeout)
     }
 }
 

@@ -234,10 +234,12 @@ mod proxy_metadata_tests {
     }
 }
 
-fn is_expected_http_connection_termination(err: &(dyn StdError + 'static)) -> bool {
-    let mut current = Some(err);
+fn is_expected_http_connection_termination<E: StdError + 'static>(
+    err: &rama_http_core::Error<E>,
+) -> bool {
+    let mut current: Option<&(dyn StdError + 'static)> = Some(err);
     while let Some(err) = current {
-        if let Some(http_err) = err.downcast_ref::<rama_http_core::Error>()
+        if let Some(http_err) = err.downcast_ref::<rama_http_core::Error<E>>()
             && (http_err.is_canceled() || http_err.is_closed() || http_err.is_body_write_aborted())
         {
             return true;
@@ -266,7 +268,7 @@ fn is_expected_http_connection_termination(err: &(dyn StdError + 'static)) -> bo
     false
 }
 
-fn log_connection_termination(err: &rama_http_core::Error) {
+fn log_connection_termination<E: StdError + 'static>(err: &rama_http_core::Error<E>) {
     if is_expected_http_connection_termination(err) {
         tracing::trace!(error = ?err, "connection closed by peer / transport");
     } else {
@@ -423,8 +425,10 @@ where
         + TargetHttpVersionInputExt
         + Send
         + 'static,
-    BodyConnection:
-        StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    BodyConnection: StreamingBody<Data: Send + 'static, Error: StdError + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
 {
     let transport = transport.into_http_transport();
     let plaintext_origin = input
@@ -536,8 +540,10 @@ where
         + 'static,
     // Body type this connector will be able to send, this is not necessarily the same one that
     // was used in the request that created this connection
-    BodyConnection:
-        StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    BodyConnection: StreamingBody<Data: Send + 'static, Error: StdError + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
 {
     let extensions = io.extensions().clone();
     let server_host = input.target_authority().map(|authority| authority.host);
@@ -650,8 +656,10 @@ pub async fn http2_eager_handshake<IO, BodyConnection>(
 ) -> Result<(HttpClientService<BodyConnection>, H2PeerSettingsHandle), OpaqueError>
 where
     IO: Io + Unpin + ExtensionsRef,
-    BodyConnection:
-        StreamingBody<Data: Send + Sync + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    BodyConnection: StreamingBody<Data: Send + Sync + 'static, Error: StdError + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
 {
     let extensions = io.extensions().clone();
 
@@ -697,8 +705,10 @@ where
         + 'static,
     // Body type this connector will be able to send, this is not necessarily the same one that
     // was used in the request that created this connection
-    BodyConnection:
-        StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    BodyConnection: StreamingBody<Data: Send + 'static, Error: StdError + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
 {
     type Output = EstablishedClientConnection<HttpClientService<BodyConnection>, Input>;
     type Error = ConnectionError;

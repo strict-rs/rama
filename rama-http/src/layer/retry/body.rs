@@ -28,7 +28,7 @@ impl RetryBody {
 
 impl StreamingBody for RetryBody {
     type Data = Bytes;
-    type Error = rama_core::error::BoxError;
+    type Error = std::convert::Infallible;
 
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,

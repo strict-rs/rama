@@ -18,15 +18,15 @@ use crate::proto::h2::ping;
 /// `Incoming` is returned to you in responses. Similarly, when operating with the server,
 /// it is provided within requests.
 #[must_use = "streams do nothing unless polled"]
-pub struct Incoming {
-    kind: Kind,
+pub struct Incoming<E = std::convert::Infallible> {
+    kind: Kind<E>,
 }
 
-enum Kind {
+enum Kind<E> {
     Empty,
     Chan {
         content_length: DecodedLength,
-        rx: chan::Receiver,
+        rx: chan::Receiver<E>,
     },
     H2 {
         content_length: DecodedLength,
@@ -40,7 +40,7 @@ enum Kind {
     H3(Box<crate::h3::body::Body>),
 }
 
-impl Incoming {
+impl<E> Incoming<E> {
     pub(crate) fn h3(body: crate::h3::body::Body) -> Self {
         Self::new(Kind::H3(Box::new(body)))
     }
@@ -50,16 +50,16 @@ impl Incoming {
     /// Useful when wanting to stream chunks from another thread.
     #[inline]
     #[cfg(test)]
-    pub(crate) fn channel() -> (Sender, Self) {
+    pub(crate) fn channel() -> (Sender<E>, Self) {
         Self::new_channel(DecodedLength::CHUNKED, /*wanter =*/ false)
     }
 
-    pub(crate) fn new_channel(content_length: DecodedLength, wanter: bool) -> (Sender, Self) {
+    pub(crate) fn new_channel(content_length: DecodedLength, wanter: bool) -> (Sender<E>, Self) {
         let (tx, rx) = chan::channel(wanter);
         (tx, Self::new(Kind::Chan { content_length, rx }))
     }
 
-    fn new(kind: Kind) -> Self {
+    fn new(kind: Kind<E>) -> Self {
         Self { kind }
     }
 
@@ -87,16 +87,18 @@ impl Incoming {
     }
 }
 
-impl StreamingBody for Incoming {
+impl<E> StreamingBody for Incoming<E> {
     type Data = Bytes;
-    type Error = crate::Error;
+    type Error = crate::Error<E>;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match &mut self.kind {
-            Kind::H3(body) => Pin::new(body.as_mut()).poll_frame(cx),
+            Kind::H3(body) => Pin::new(body.as_mut())
+                .poll_frame(cx)
+                .map(|frame| frame.map(|frame| frame.map_err(crate::Error::into_body_error))),
             Kind::Empty => Poll::Ready(None),
             Kind::Chan {
                 content_length: len,
@@ -188,7 +190,7 @@ impl StreamingBody for Incoming {
     }
 }
 
-impl fmt::Debug for Incoming {
+impl<E> fmt::Debug for Incoming<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[derive(Debug)]
         struct Streaming;
@@ -247,12 +249,24 @@ mod tests {
             assert_eq!(a.upper(), b.upper(), "upper for {note:?}");
         }
 
-        eq(Incoming::empty(), SizeHint::with_exact(0), "empty");
-
-        eq(Incoming::channel().1, SizeHint::new(), "channel");
+        eq(
+            Incoming::<std::convert::Infallible>::empty(),
+            SizeHint::with_exact(0),
+            "empty",
+        );
 
         eq(
-            Incoming::new_channel(DecodedLength::new(4), /*wanter =*/ false).1,
+            Incoming::<std::convert::Infallible>::channel().1,
+            SizeHint::new(),
+            "channel",
+        );
+
+        eq(
+            Incoming::<std::convert::Infallible>::new_channel(
+                DecodedLength::new(4),
+                /*wanter =*/ false,
+            )
+            .1,
             SizeHint::with_exact(4),
             "channel with length",
         );
@@ -261,7 +275,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn channel_abort() {
-        let (tx, mut rx) = Incoming::channel();
+        let (tx, mut rx) = Incoming::<std::convert::Infallible>::channel();
 
         tx.abort();
 
@@ -272,7 +286,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn channel_abort_when_buffer_is_full() {
-        let (mut tx, mut rx) = Incoming::channel();
+        let (mut tx, mut rx) = Incoming::<std::convert::Infallible>::channel();
 
         tx.try_send_data("chunk 1".into()).expect("send 1");
         // buffer is full, but can still send abort
@@ -293,7 +307,7 @@ mod tests {
 
     #[test]
     fn channel_buffers_one() {
-        let (mut tx, _rx) = Incoming::channel();
+        let (mut tx, _rx) = Incoming::<std::convert::Infallible>::channel();
 
         tx.try_send_data("chunk 1".into()).expect("send 1");
 
@@ -305,14 +319,17 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn channel_empty() {
-        let (_, mut rx) = Incoming::channel();
+        let (_, mut rx) = Incoming::<std::convert::Infallible>::channel();
 
         assert!(rx.frame().await.is_none());
     }
 
     #[test]
     fn channel_ready() {
-        let (mut tx, _rx) = Incoming::new_channel(DecodedLength::CHUNKED, /*wanter = */ false);
+        let (mut tx, _rx) = Incoming::<std::convert::Infallible>::new_channel(
+            DecodedLength::CHUNKED,
+            /*wanter = */ false,
+        );
 
         let mut tx_ready = tokio_test::task::spawn(tx.ready());
 
@@ -321,8 +338,10 @@ mod tests {
 
     #[test]
     fn channel_wanter() {
-        let (mut tx, mut rx) =
-            Incoming::new_channel(DecodedLength::CHUNKED, /*wanter = */ true);
+        let (mut tx, mut rx) = Incoming::<std::convert::Infallible>::new_channel(
+            DecodedLength::CHUNKED,
+            /*wanter = */ true,
+        );
 
         let mut tx_ready = tokio_test::task::spawn(tx.ready());
         let mut rx_data = tokio_test::task::spawn(rx.frame());
@@ -343,7 +362,10 @@ mod tests {
 
     #[test]
     fn channel_notices_closure() {
-        let (mut tx, rx) = Incoming::new_channel(DecodedLength::CHUNKED, /*wanter = */ true);
+        let (mut tx, rx) = Incoming::<std::convert::Infallible>::new_channel(
+            DecodedLength::CHUNKED,
+            /*wanter = */ true,
+        );
 
         let mut tx_ready = tokio_test::task::spawn(tx.ready());
 

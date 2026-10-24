@@ -376,7 +376,9 @@ where
         self.close_read();
         self.io.consume_leading_lines();
         let was_mid_parse = e.is_parse() || !self.io.read_buf().is_empty();
-        if was_mid_parse || must_error {
+        // Only an incomplete-message result with no bytes can represent orderly
+        // EOF here. A native read error still matters before the first request.
+        if was_mid_parse || must_error || !e.is_incomplete_message() {
             // We check if the buf contains the h2 Preface
             debug!(
                 "parse error ({}) with {} bytes",

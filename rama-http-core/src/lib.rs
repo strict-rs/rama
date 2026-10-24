@@ -61,8 +61,8 @@ pub mod body;
 
 mod common;
 
-mod error;
-pub use self::error::{Error, Result};
+pub mod error;
+pub use self::error::{Cause, Error, IncompleteBody, ParserError, Result, StateFailure};
 
 pub mod h2;
 pub mod h3;

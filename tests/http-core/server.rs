@@ -20,7 +20,7 @@ use futures_channel::oneshot;
 use parking_lot::Mutex;
 use rama::{
     ServiceInput,
-    error::BoxError,
+    error::{ArcError, BoxError},
     extensions::{Extensions, ExtensionsRef},
     futures::future::{self, Either, FutureExt},
     http::{
@@ -46,6 +46,8 @@ use tokio::{
 };
 
 use super::support;
+
+mod chunked_body;
 
 #[test]
 fn get_should_ignore_body() {
@@ -501,35 +503,6 @@ fn post_with_chunked_body() {
     _ = req.read(&mut [0; 256]).unwrap();
 
     assert_eq!(server.body(), b"qwert");
-}
-
-#[test]
-fn post_with_chunked_overflow() {
-    use std::error::Error as _;
-    let server = serve();
-    let mut req = connect(server.addr());
-    req.write_all(
-        b"\
-        POST / HTTP/1.1\r\n\
-        Host: example.domain\r\n\
-        Transfer-Encoding: chunked\r\n\
-        \r\n\
-        f0000000000000003\r\n\
-        abc\r\n\
-        0\r\n\
-        \r\n\
-        GET /sneaky HTTP/1.1\r\n\
-        \r\n\
-    ",
-    )
-    .unwrap();
-    _ = req.read(&mut [0; 256]).unwrap();
-
-    let err = server.body_err().source().unwrap().to_string();
-    assert!(
-        err.contains("overflow"),
-        "error should be overflow: {err:?}",
-    );
 }
 
 #[test]
@@ -3743,11 +3716,11 @@ impl Serve {
         self.try_body().expect("body")
     }
 
-    fn body_err(&self) -> BoxError {
+    fn body_err(&self) -> ArcError {
         self.try_body().expect_err("body_err")
     }
 
-    fn try_body(&self) -> Result<Vec<u8>, BoxError> {
+    fn try_body(&self) -> Result<Vec<u8>, ArcError> {
         let mut buf = vec![];
         loop {
             match self.msg_rx.recv() {
@@ -3867,7 +3840,7 @@ enum Reply {
 #[derive(Debug)]
 enum Msg {
     Chunk(Vec<u8>),
-    Error(BoxError),
+    Error(ArcError),
     End,
 }
 

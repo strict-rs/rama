@@ -436,7 +436,9 @@ impl Status {
     /// Returns Some if there's a way to handle the error, or None if the information from this
     /// rama-http-core error, but perhaps not its source, should be ignored.
     #[cfg(feature = "transport")]
-    fn from_http_error(err: &rama_http_core::Error) -> Option<Self> {
+    fn from_http_error<E: std::error::Error + 'static>(
+        err: &rama_http_core::Error<E>,
+    ) -> Option<Self> {
         // is_timeout results from hyper's keep-alive logic
         // (https://docs.rs/hyper/0.14.11/src/hyper/error.rs.html#192-194).  Per the grpc spec
         // > An expired client initiated PING will cause all calls to be closed with an UNAVAILABLE
@@ -673,6 +675,10 @@ fn find_status_in_source_chain(err: &(dyn Error + 'static)) -> Option<Status> {
         if let Some(http_err) = err
             .downcast_ref::<rama_http_core::Error>()
             .and_then(Status::from_http_error)
+            .or_else(|| {
+                err.downcast_ref::<rama_http_core::Error<rama_core::error::ArcError>>()
+                    .and_then(Status::from_http_error)
+            })
         {
             return Some(http_err);
         }

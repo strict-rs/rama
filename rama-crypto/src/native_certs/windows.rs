@@ -24,14 +24,26 @@ pub(super) fn load_native_certs() -> CertificateResult {
             let store = match open(store_name) {
                 Ok(store) => store,
                 Err(err) => {
-                    result.os_error(err.into(), "failed to open windows certificate store");
+                    result.os_error(err, "failed to open windows certificate store");
                     continue;
                 }
             };
 
             for cert in store.certs() {
-                let time_valid = cert.is_time_valid().unwrap_or_default();
-                let tls_usable = cert.valid_uses().map(usable_for_tls).unwrap_or_default();
+                let time_valid = match cert.is_time_valid() {
+                    Ok(valid) => valid,
+                    Err(cause) => {
+                        result.os_error(cause, "failed to inspect certificate validity");
+                        false
+                    }
+                };
+                let tls_usable = match cert.valid_uses() {
+                    Ok(uses) => usable_for_tls(uses),
+                    Err(cause) => {
+                        result.os_error(cause, "failed to inspect certificate uses");
+                        false
+                    }
+                };
                 if time_valid && tls_usable {
                     result
                         .certs

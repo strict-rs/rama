@@ -16,7 +16,13 @@ mod error;
 #[doc(inline)]
 pub use error::{ConnectionError, ConnectionErrorDomain, ConnectionErrorKind};
 
+mod connection_race;
 mod connector;
+#[doc(inline)]
+pub use connection_race::{
+    ConnectionRace, ConnectionRaceFailure, ConnectionRaceReceipt, RaceAttemptFailure,
+    RaceCancellation, RaceCandidates, RaceConnected,
+};
 #[doc(inline)]
 pub use connector::{
     AddressCandidates, ConnectorTarget, ConnectorTargetStream, ConnectorTransportProtocol,

@@ -6,7 +6,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use rama_core::error::BoxError;
 use rama_core::extensions::ExtensionsRef;
 use rama_core::futures::future::Either;
 use rama_core::rt::Executor;
@@ -24,13 +23,13 @@ use crate::client::dispatch::{self, TrySendError};
 use crate::proto;
 
 /// The sender side of an established connection.
-pub struct SendRequest<B> {
-    dispatch: dispatch::UnboundedSender<Request<B>, Response<IncomingBody>>,
+pub struct SendRequest<B: StreamingBody> {
+    dispatch: dispatch::UnboundedSender<Request<B>, Response<IncomingBody<B::Error>>, B::Error>,
     peer_settings: H2PeerSettingsHandle,
     admission: ConnectionAdmission,
 }
 
-impl<B> Clone for SendRequest<B> {
+impl<B: StreamingBody> Clone for SendRequest<B> {
     fn clone(&self) -> Self {
         Self {
             dispatch: self.dispatch.clone(),
@@ -57,7 +56,10 @@ impl<B> Clone for SendRequest<B> {
 pub struct Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     inner: (PhantomData<T>, proto::h2::ClientTask<B, T>),
 }
@@ -87,21 +89,24 @@ pub struct Builder {
 pub async fn handshake<T, B>(
     exec: Executor,
     io: T,
-) -> crate::Result<(SendRequest<B>, Connection<T, B>)>
+) -> crate::Result<(SendRequest<B>, Connection<T, B>), B::Error>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     Builder::new(exec).handshake(io).await
 }
 
 // ===== impl SendRequest
 
-impl<B> SendRequest<B> {
+impl<B: StreamingBody> SendRequest<B> {
     /// Polls to determine whether this sender can be used yet for a request.
     ///
     /// If the associated connection is closed, this returns an Error.
-    pub fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+    pub fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<crate::Result<(), B::Error>> {
         if self.is_closed() {
             Poll::Ready(Err(crate::Error::new_closed()))
         } else {
@@ -114,7 +119,7 @@ impl<B> SendRequest<B> {
     /// # Errors
     ///
     /// If the associated connection is closed, this returns an Error.
-    pub async fn ready(&mut self) -> crate::Result<()> {
+    pub async fn ready(&mut self) -> crate::Result<(), B::Error> {
         std::future::poll_fn(|cx| self.poll_ready(cx)).await
     }
 
@@ -148,9 +153,12 @@ impl<B> SendRequest<B> {
     }
 }
 
-impl<B> SendRequest<B>
+impl<B: StreamingBody> SendRequest<B>
 where
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     /// Sends a `Request` on the associated connection.
     ///
@@ -177,7 +185,7 @@ where
     pub fn send_request(
         &mut self,
         req: Request<B>,
-    ) -> impl Future<Output = crate::Result<Response<IncomingBody>>> {
+    ) -> impl Future<Output = crate::Result<Response<IncomingBody<B::Error>>, B::Error>> {
         // RFC 8441 §3: `:protocol` is only permitted once the server sent
         // SETTINGS_ENABLE_CONNECT_PROTOCOL; wait for its SETTINGS first. This rare
         // path is boxed so ordinary request futures keep their size.
@@ -186,9 +194,8 @@ where
             let dispatch = self.dispatch.clone();
             return Either::Left(Box::pin(async move {
                 if peer_settings.await_settings().await.is_none() {
-                    return Err(
-                        crate::Error::new_canceled().with("connection closed before peer SETTINGS")
-                    );
+                    return Err(crate::Error::new_canceled()
+                        .with(crate::StateFailure::PeerSettingsUnavailable));
                 }
                 response(dispatch.send(req)).await
             }));
@@ -207,7 +214,8 @@ where
     pub fn try_send_request(
         &mut self,
         req: Request<B>,
-    ) -> impl Future<Output = Result<Response<IncomingBody>, TrySendError<Request<B>>>> {
+    ) -> impl Future<Output = Result<Response<IncomingBody<B::Error>>, TrySendError<Request<B>, B::Error>>>
+    {
         if req.extensions().contains::<Protocol>() {
             let peer_settings = self.peer_settings.clone();
             let mut dispatch = self.dispatch.clone();
@@ -215,7 +223,7 @@ where
                 if peer_settings.await_settings().await.is_none() {
                     return Err(TrySendError {
                         error: crate::Error::new_canceled()
-                            .with("connection closed before peer SETTINGS"),
+                            .with(crate::StateFailure::PeerSettingsUnavailable),
                         message: Some(req),
                     });
                 }
@@ -228,12 +236,12 @@ where
 
 /// Await the dispatched request's response. A request that was not sent is dropped here,
 /// so the future only holds the response promise.
-fn response<B>(
-    sent: Result<dispatch::Promise<Response<IncomingBody>>, Request<B>>,
-) -> impl Future<Output = crate::Result<Response<IncomingBody>>> {
+fn response<B: StreamingBody>(
+    sent: Result<dispatch::Promise<Response<IncomingBody<B::Error>>, B::Error>, Request<B>>,
+) -> impl Future<Output = crate::Result<Response<IncomingBody<B::Error>>, B::Error>> {
     let sent = sent.map_err(|_req| {
         debug!("connection was not ready");
-        crate::Error::new_canceled().with("connection was not ready")
+        crate::Error::new_canceled().with(crate::StateFailure::ConnectionNotReady)
     });
     async move {
         match sent?.await {
@@ -245,9 +253,12 @@ fn response<B>(
     }
 }
 
-async fn try_response<B>(
-    sent: Result<dispatch::RetryPromise<Request<B>, Response<IncomingBody>>, Request<B>>,
-) -> Result<Response<IncomingBody>, TrySendError<Request<B>>> {
+async fn try_response<B: StreamingBody>(
+    sent: Result<
+        dispatch::RetryPromise<Request<B>, Response<IncomingBody<B::Error>>, B::Error>,
+        Request<B>,
+    >,
+) -> Result<Response<IncomingBody<B::Error>>, TrySendError<Request<B>, B::Error>> {
     match sent {
         Ok(rx) => match rx.await {
             Ok(Ok(res)) => Ok(res),
@@ -257,7 +268,7 @@ async fn try_response<B>(
         },
         Err(req) => {
             debug!("connection was not ready");
-            let error = crate::Error::new_canceled().with("connection was not ready");
+            let error = crate::Error::new_canceled().with(crate::StateFailure::ConnectionNotReady);
             Err(TrySendError {
                 error,
                 message: Some(req),
@@ -266,7 +277,7 @@ async fn try_response<B>(
     }
 }
 
-impl<B> fmt::Debug for SendRequest<B> {
+impl<B: StreamingBody> fmt::Debug for SendRequest<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SendRequest").finish()
     }
@@ -277,7 +288,10 @@ impl<B> fmt::Debug for SendRequest<B> {
 impl<T, B> Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     /// Returns whether the [extended CONNECT protocol][1] is enabled or not.
     ///
@@ -379,7 +393,10 @@ impl H2PeerSettingsHandle {
 impl<T, B> fmt::Debug for Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + fmt::Debug + Send + 'static + Unpin,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection").finish()
@@ -389,9 +406,12 @@ where
 impl<T, B> Future for Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef + 'static,
-    B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + 'static
+        + Unpin,
 {
-    type Output = crate::Result<()>;
+    type Output = crate::Result<(), B::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match std::task::ready!(Pin::new(&mut self.inner.1).poll(cx))? {
@@ -758,10 +778,13 @@ impl Builder {
     pub fn handshake<T, B>(
         &self,
         io: T,
-    ) -> impl Future<Output = crate::Result<(SendRequest<B>, Connection<T, B>)>>
+    ) -> impl Future<Output = crate::Result<(SendRequest<B>, Connection<T, B>), B::Error>>
     where
         T: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
-        B: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Send + 'static + Unpin,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + 'static
+            + Unpin,
     {
         let opts = self.clone();
 
@@ -933,7 +956,7 @@ mod tests {
         service: S,
     ) -> (
         crate::client::conn::http2::SendRequest<Body>,
-        tokio::task::JoinHandle<crate::Result<()>>,
+        tokio::task::JoinHandle<crate::Result<(), rama_core::error::ArcError>>,
     )
     where
         S: rama_core::Service<Request, Output = Response, Error = Infallible> + Clone,

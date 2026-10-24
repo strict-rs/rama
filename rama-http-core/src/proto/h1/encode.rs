@@ -29,8 +29,7 @@ pub(crate) struct EncodedBuf<B> {
     kind: BufKind<B>,
 }
 
-#[derive(Debug)]
-pub(crate) struct NotEof(u64);
+use crate::IncompleteBody;
 
 #[derive(Debug, PartialEq, Clone)]
 enum Kind {
@@ -141,13 +140,13 @@ impl Encoder {
         matches!(self.kind, Kind::Chunked(_))
     }
 
-    pub(crate) fn end<B>(&self) -> Result<Option<EncodedBuf<B>>, NotEof> {
+    pub(crate) fn end<B>(&self) -> Result<Option<EncodedBuf<B>>, IncompleteBody> {
         match self.kind {
             Kind::CloseDelimited | Kind::Length(0) => Ok(None),
             Kind::Chunked(_) => Ok(Some(EncodedBuf {
                 kind: BufKind::ChunkedEnd(b"0\r\n\r\n"),
             })),
-            Kind::Length(n) => Err(NotEof(n)),
+            Kind::Length(n) => Err(IncompleteBody { remaining: n }),
         }
     }
 
@@ -410,14 +409,6 @@ impl<B: Buf> From<Chain<Chain<ChunkSize, B>, StaticBuf>> for EncodedBuf<B> {
         }
     }
 }
-
-impl fmt::Display for NotEof {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "early end, expected {} more bytes", self.0)
-    }
-}
-
-impl std::error::Error for NotEof {}
 
 #[cfg(test)]
 mod tests {

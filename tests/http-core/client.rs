@@ -1,6 +1,8 @@
 #![deny(warnings)]
 #![warn(rust_2018_idioms)]
 
+mod aborted_body;
+
 use std::convert::Infallible;
 use std::fmt;
 use std::io::{Read, Write};
@@ -1655,7 +1657,6 @@ mod conn {
     };
     use tokio::net::{TcpListener as TkTcpListener, TcpStream};
 
-    use rama::error::BoxError;
     use rama::http::body::util::{BodyExt, Empty, StreamBody};
     use rama::http::core::body::Frame;
     use rama::http::core::client::conn;
@@ -1891,58 +1892,6 @@ mod conn {
         };
 
         future::join(server, client).await;
-    }
-
-    #[test]
-    fn aborted_body_isnt_completed() {
-        let (server, addr) = setup_std_test_server();
-        let rt = support::runtime();
-
-        let (tx, rx) = oneshot::channel();
-        let server = thread::spawn(move || {
-            let mut sock = server.accept().unwrap().0;
-            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            sock.set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let expected = "POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n";
-            let mut buf = vec![0; expected.len()];
-            sock.read_exact(&mut buf).expect("read 1");
-            assert_eq!(s(&buf), expected);
-
-            _ = tx.send(());
-
-            assert_eq!(sock.read(&mut buf).expect("read 2"), 0);
-        });
-
-        let tcp = rt.block_on(tcp_connect(&addr)).unwrap();
-        let tcp = ServiceInput::new(tcp);
-
-        let (mut client, conn) = rt.block_on(conn::http1::handshake(tcp)).unwrap();
-
-        rt.spawn(conn.map_err(|e| panic!("conn error: {e}")).map(drop));
-
-        let (mut sender, recv) = mpsc::channel::<Result<Frame<Bytes>, BoxError>>(0);
-
-        let sender = thread::spawn(move || {
-            sender
-                .try_send(Ok(Frame::data("hello".into())))
-                .expect("try_send_data");
-            support::runtime().block_on(rx).unwrap();
-
-            // Aborts the body in an abnormal fashion.
-            _ = sender.try_send(Err(Box::new(std::io::Error::other("body write aborted"))));
-        });
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/")
-            .body(StreamBody::new(recv))
-            .unwrap();
-        let res = client.send_request(req);
-        rt.block_on(res).unwrap_err();
-
-        server.join().expect("server thread panicked");
-        sender.join().expect("sender thread panicked");
     }
 
     #[test]
@@ -2808,7 +2757,7 @@ mod conn {
         });
 
         // Use a channel to keep request stream open
-        let (_tx, recv) = mpsc::channel::<Result<Frame<Bytes>, BoxError>>(0);
+        let (_tx, recv) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(0);
         let req = rama::http::Request::new(StreamBody::new(recv));
 
         let _resp = client.send_request(req).await.expect("send_request");
@@ -2859,7 +2808,7 @@ mod conn {
         });
 
         // Use a channel to keep request stream open
-        let (_tx, recv) = mpsc::channel::<Result<Frame<Bytes>, BoxError>>(0);
+        let (_tx, recv) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(0);
         let req = Request::post("/a").body(StreamBody::new(recv)).unwrap();
         let resp = client.send_request(req).await.expect("send_request");
         assert!(resp.status().is_success());
@@ -2989,7 +2938,7 @@ mod conn {
         });
 
         // Use a channel to keep request stream open
-        let (_tx, recv) = mpsc::channel::<Result<Frame<Bytes>, BoxError>>(0);
+        let (_tx, recv) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(0);
         let req = Request::post("/a").body(StreamBody::new(recv)).unwrap();
         let resp = client.send_request(req).await.expect("send_request");
         assert!(resp.status().is_success());
@@ -3700,7 +3649,7 @@ mod conn {
 
         let io = ServiceInput::new(client_io);
         let (mut client, conn) = conn::http2::Builder::new(Executor::default())
-            .handshake::<_, BoxBody<Bytes, BoxError>>(io)
+            .handshake::<_, BoxBody<Bytes, std::io::Error>>(io)
             .await
             .expect("http handshake");
         tokio::spawn(async move {
@@ -3710,8 +3659,8 @@ mod conn {
         // Request A: streaming body that sends STREAM_A_LEN bytes and then
         // stays open, waiting for more data. This fills the advertised
         // connection-level window down to one byte remaining.
-        let (mut tx_a, rx_a) = mpsc::channel::<Result<Frame<Bytes>, BoxError>>(4);
-        let body_a: BoxBody<Bytes, BoxError> = BodyExt::boxed(StreamBody::new(rx_a));
+        let (mut tx_a, rx_a) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
+        let body_a: BoxBody<Bytes, std::io::Error> = BodyExt::boxed(StreamBody::new(rx_a));
         let req_a = Request::post("http://localhost/a").body(body_a).unwrap();
         let mut client_a = client.clone();
         let a_handle = tokio::spawn(async move { client_a.send_request(req_a).await });
@@ -3746,7 +3695,7 @@ mod conn {
         // Request B: one byte of body. With the bug in `PipeToSendStream`,
         // stream A pins the last byte of connection window via a speculative
         // reserve, so stream B can never ship its data frame.
-        let body_b: BoxBody<Bytes, BoxError> = BodyExt::boxed(
+        let body_b: BoxBody<Bytes, std::io::Error> = BodyExt::boxed(
             Full::new(Bytes::from_static(b"b"))
                 .map_err(|never: std::convert::Infallible| match never {}),
         );

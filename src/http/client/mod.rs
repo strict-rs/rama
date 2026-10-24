@@ -156,7 +156,10 @@ pub type BlockingHttpWebClient = BlockingHttpClient<DefaultHttpWebClient>;
 
 impl<Body> Default for DefaultHttpWebClient<Body>
 where
-    Body: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    Body: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
 {
     #[inline(always)]
     fn default() -> Self {
@@ -166,7 +169,10 @@ where
 
 impl<Body> DefaultHttpWebClient<Body>
 where
-    Body: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    Body: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
 {
     core::cfg_select! {
         feature = "boring" => {
@@ -384,15 +390,20 @@ impl<BodyIn, ConnResponse, L> EasyHttpWebClient<BodyIn, ConnResponse, L> {
 impl<Body, ConnectionBody, Connection, IncomingBody, L> Service<Request<Body>>
     for EasyHttpWebClient<Body, EstablishedClientConnection<Connection, Request<ConnectionBody>>, L>
 where
-    Body: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    Body: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
     Connection: Service<Request<ConnectionBody>, Output = Response<IncomingBody>, Error = BoxError>
         + ExtensionsRef,
     IncomingBody: Send + Sync + 'static,
     ResponseBody: From<IncomingBody>,
     // Body type this connection will be able to send, this is not necessarily the same one that
     // was used in the request that created this connection
-    ConnectionBody:
-        StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    ConnectionBody: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
     L: Layer<
             HttpForwardProxyService<MapResponseBody<Connection, fn(IncomingBody) -> ResponseBody>>,
             Service: Service<Request<ConnectionBody>, Output = Response, Error = BoxError>,

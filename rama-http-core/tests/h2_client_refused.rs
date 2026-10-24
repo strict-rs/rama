@@ -22,7 +22,7 @@ use tokio::{
 };
 
 type Origin = h2_server::Connection<ServiceInput<DuplexStream>, Bytes>;
-type ClientConn = JoinHandle<rama_http_core::Result<()>>;
+type ClientConn = JoinHandle<rama_http_core::Result<(), rama_core::error::ArcError>>;
 
 async fn connect() -> (http2::SendRequest<Body>, Origin, ClientConn) {
     connect_with(h2_server::Builder::new()).await
@@ -51,7 +51,12 @@ fn send(
     client: &http2::SendRequest<Body>,
     method: &str,
     body: &'static str,
-) -> JoinHandle<rama_http_core::Result<Response<Incoming>>> {
+) -> JoinHandle<
+    rama_http_core::Result<
+        Response<Incoming<rama_core::error::ArcError>>,
+        rama_core::error::ArcError,
+    >,
+> {
     let mut client = client.clone();
     let req = Request::builder()
         .method(method)
@@ -77,7 +82,12 @@ async fn go_away(mut origin: Origin, reason: Reason) {
 }
 
 async fn assert_refused(
-    resp: JoinHandle<rama_http_core::Result<Response<Incoming>>>,
+    resp: JoinHandle<
+        rama_http_core::Result<
+            Response<Incoming<rama_core::error::ArcError>>,
+            rama_core::error::ArcError,
+        >,
+    >,
     refused: bool,
     what: &str,
 ) {

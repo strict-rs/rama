@@ -37,6 +37,11 @@ use rama_core::telemetry::tracing::{debug, warn};
 use crate::pki_types::CertificateDer;
 use crate::pki_types::pem::{self, PemObject};
 
+#[cfg(windows)]
+pub type PlatformCertificateError = io::Error;
+#[cfg(target_os = "macos")]
+pub type PlatformCertificateError = security_framework::base::Error;
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod unix;
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -163,7 +168,7 @@ impl CertificateResult {
     }
 
     #[cfg(any(windows, target_os = "macos"))]
-    fn os_error(&mut self, err: Box<dyn StdError + Send + Sync + 'static>, context: &'static str) {
+    fn os_error(&mut self, err: PlatformCertificateError, context: &'static str) {
         self.errors.push(Error {
             context,
             kind: ErrorKind::Os(err),
@@ -327,7 +332,8 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         Some(match &self.kind {
             ErrorKind::Io { inner, .. } => inner,
-            ErrorKind::Os(err) => &**err,
+            #[cfg(any(windows, target_os = "macos"))]
+            ErrorKind::Os(err) => err,
             ErrorKind::Pem(err) => err,
         })
     }
@@ -339,6 +345,7 @@ impl fmt::Display for Error {
         f.write_str(": ")?;
         match &self.kind {
             ErrorKind::Io { inner, path } => write!(f, "{inner} at '{}'", path.display()),
+            #[cfg(any(windows, target_os = "macos"))]
             ErrorKind::Os(err) => err.fmt(f),
             ErrorKind::Pem(err) => err.fmt(f),
         }
@@ -357,7 +364,8 @@ pub enum ErrorKind {
         path: PathBuf,
     },
     /// A platform (OS keychain / cert store) error.
-    Os(Box<dyn StdError + Send + Sync + 'static>),
+    #[cfg(any(windows, target_os = "macos"))]
+    Os(PlatformCertificateError),
     /// A PEM parsing error.
     Pem(pem::Error),
 }

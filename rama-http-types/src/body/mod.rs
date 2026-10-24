@@ -5,7 +5,7 @@
 use crate::body::util::BodyExt;
 use pin_project_lite::pin_project;
 use rama_core::bytes::Bytes;
-use rama_core::error::BoxError;
+use rama_core::error::{ArcError, BoxError};
 use rama_core::futures::TryStream;
 use rama_core::futures::stream::Stream;
 use rama_core::stream::json;
@@ -35,6 +35,9 @@ pub mod util {
 
 mod limit;
 pub use limit::BodyLimit;
+
+mod collection;
+pub use collection::{BodyCollection, CollectionFailure, CollectionIssue};
 
 mod ext;
 pub use ext::BodyExtractExt;
@@ -113,13 +116,16 @@ impl<B: StreamingBody> StreamingBody for crate::Response<B> {
 
 // Rama specific stuff
 
-type BoxBody = util::combinators::BoxBody<Bytes, BoxError>;
+type BoxBody = util::combinators::BoxBody<Bytes, ArcError>;
 
 fn boxed<B>(body: B) -> BoxBody
 where
     B: StreamingBody<Data = Bytes, Error: Into<BoxError>> + Send + Sync + 'static,
 {
-    try_downcast(body).unwrap_or_else(|body| body.map_err(Into::into).boxed())
+    try_downcast(body).unwrap_or_else(|body| {
+        body.map_err(|cause| ArcError::from_box_error(cause.into()))
+            .boxed()
+    })
 }
 
 #[expect(clippy::unwrap_used)]
@@ -311,7 +317,7 @@ impl Body {
     /// Stream a chunk of the response body.
     ///
     /// When the response body has been exhausted, this will return `None`.
-    pub async fn chunk(&mut self) -> Result<Option<Bytes>, BoxError> {
+    pub async fn chunk(&mut self) -> Result<Option<Bytes>, ArcError> {
         // loop to ignore unrecognized frames
         loop {
             if let Some(res) = self.frame().await {
@@ -378,7 +384,7 @@ body_from_impl!(Bytes);
 
 impl StreamingBody for Body {
     type Data = Bytes;
-    type Error = BoxError;
+    type Error = ArcError;
 
     #[inline]
     fn poll_frame(
@@ -409,7 +415,7 @@ pub struct BodyDataStream {
 }
 
 impl Stream for BodyDataStream {
-    type Item = Result<Bytes, BoxError>;
+    type Item = Result<Bytes, ArcError>;
 
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -427,7 +433,7 @@ impl Stream for BodyDataStream {
 
 impl StreamingBody for BodyDataStream {
     type Data = Bytes;
-    type Error = BoxError;
+    type Error = ArcError;
 
     #[inline]
     fn poll_frame(

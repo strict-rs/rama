@@ -1,10 +1,10 @@
 //! The channel feeding an HTTP/1 [`Incoming`](super::Incoming) body: data, an
 //! error, trailers and the expect-continue want share a single allocation.
 
-use std::fmt;
 use std::mem;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::{convert::Infallible, fmt};
 
 use atomic_waker::AtomicWaker;
 use parking_lot::Mutex;
@@ -15,7 +15,7 @@ use rama_http_types::HeaderMap;
 use std::future::poll_fn;
 
 /// With `wanter` set, the sender is not ready before the body is first polled.
-pub(crate) fn channel(wanter: bool) -> (Sender, Receiver) {
+pub(crate) fn channel<E>(wanter: bool) -> (Sender<E>, Receiver<E>) {
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             item: None,
@@ -45,26 +45,26 @@ pub(crate) fn channel(wanter: bool) -> (Sender, Receiver) {
 ///
 /// Dropping it ends the body normally; send an error first to end it abnormally.
 #[must_use = "Sender does nothing unless sent on"]
-pub(crate) struct Sender {
-    shared: Arc<Shared>,
+pub(crate) struct Sender<E = Infallible> {
+    shared: Arc<Shared<E>>,
     trailers_sent: bool,
 }
 
-pub(crate) struct Receiver {
-    shared: Arc<Shared>,
+pub(crate) struct Receiver<E = Infallible> {
+    shared: Arc<Shared<E>>,
     terminated: bool,
 }
 
-struct Shared {
-    state: Mutex<State>,
+struct Shared<E> {
+    state: Mutex<State<E>>,
     sender_waker: AtomicWaker,
     receiver_waker: AtomicWaker,
 }
 
-struct State {
-    item: Option<Result<Bytes, crate::Error>>,
+struct State<E> {
+    item: Option<Result<Bytes, crate::Error<E>>>,
     // An error must not displace data the receiver has yet to take.
-    pending_error: Option<crate::Error>,
+    pending_error: Option<crate::Error<E>>,
     trailers: Option<HeaderMap>,
     sender_open: bool,
     receiver_open: bool,
@@ -75,9 +75,9 @@ struct State {
     clippy::needless_pass_by_ref_mut,
     reason = "a body has a single sender, even though the state it writes is shared"
 )]
-impl Sender {
+impl<E> Sender<E> {
     /// Ready once the body is wanted and the receiver took what was sent before.
-    pub(crate) fn poll_ready(&mut self, cx: &Context<'_>) -> Poll<crate::Result<()>> {
+    pub(crate) fn poll_ready(&mut self, cx: &Context<'_>) -> Poll<crate::Result<(), E>> {
         self.shared.sender_waker.register(cx.waker());
         let state = self.shared.state.lock();
         if !state.receiver_open {
@@ -90,7 +90,7 @@ impl Sender {
     }
 
     #[cfg(test)]
-    pub(crate) async fn ready(&mut self) -> crate::Result<()> {
+    pub(crate) async fn ready(&mut self) -> crate::Result<(), E> {
         poll_fn(|cx| self.poll_ready(cx)).await
     }
 
@@ -129,7 +129,7 @@ impl Sender {
         Ok(())
     }
 
-    pub(crate) fn send_error(&mut self, err: crate::Error) {
+    pub(crate) fn send_error(&mut self, err: crate::Error<E>) {
         let mut state = self.shared.state.lock();
         if !state.receiver_open {
             return;
@@ -149,11 +149,11 @@ impl Sender {
     }
 }
 
-impl Receiver {
+impl<E> Receiver<E> {
     pub(crate) fn poll_next(
         &mut self,
         cx: &Context<'_>,
-    ) -> Poll<Option<Result<Bytes, crate::Error>>> {
+    ) -> Poll<Option<Result<Bytes, crate::Error<E>>>> {
         if self.terminated {
             return Poll::Ready(None);
         }
@@ -192,7 +192,7 @@ impl Receiver {
     }
 }
 
-impl Drop for Sender {
+impl<E> Drop for Sender<E> {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock();
         state.sender_open = false;
@@ -204,7 +204,7 @@ impl Drop for Sender {
     }
 }
 
-impl Drop for Receiver {
+impl<E> Drop for Receiver<E> {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock();
         state.receiver_open = false;
@@ -216,7 +216,7 @@ impl Drop for Receiver {
     }
 }
 
-impl fmt::Debug for Sender {
+impl<E> fmt::Debug for Sender<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.shared.state.lock().receiver_open {
             f.write_str("Sender(Open)")
@@ -250,7 +250,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn error_queued_behind_accepted_data() {
-        let (mut tx, mut rx) = channel(false);
+        let (mut tx, mut rx) = channel::<std::convert::Infallible>(false);
         tx.try_send_data(Bytes::from_static(b"data")).unwrap();
         tx.send_error(crate::Error::new_incomplete());
         drop(tx);
@@ -263,7 +263,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn trailers_follow_data_close() {
-        let (mut tx, mut rx) = channel(false);
+        let (mut tx, mut rx) = channel::<std::convert::Infallible>(false);
         let mut trailers = HeaderMap::new();
         trailers.insert("x-trailer", HeaderValue::from_static("value"));
         tx.try_send_trailers(trailers).unwrap();
@@ -280,7 +280,7 @@ mod tests {
         let waker = Waker::from(wakes.clone());
         let cx = Context::from_waker(&waker);
 
-        let (mut tx, mut rx) = channel(false);
+        let (mut tx, mut rx) = channel::<std::convert::Infallible>(false);
         tx.try_send_data(Bytes::from_static(b"data")).unwrap();
         tx.send_error(crate::Error::new_incomplete());
         assert!(rx.poll_next(&cx).is_ready());
@@ -299,27 +299,27 @@ mod tests {
         let count = || wakes.0.load(Ordering::Relaxed);
 
         // A receiver dropped after the sender does not wake the sender's stale waker.
-        let (mut tx, rx) = channel(true);
+        let (mut tx, rx) = channel::<std::convert::Infallible>(true);
         assert!(tx.poll_ready(&cx).is_pending());
         drop(tx);
         drop(rx);
         assert_eq!(count(), 0);
 
         // Nor does a sender dropped after the receiver.
-        let (tx, mut rx) = channel(false);
+        let (tx, mut rx) = channel::<std::convert::Infallible>(false);
         assert!(rx.poll_next(&cx).is_pending());
         drop(rx);
         drop(tx);
         assert_eq!(count(), 0);
 
         // An open peer is still woken to observe the close.
-        let (mut tx, rx) = channel(true);
+        let (mut tx, rx) = channel::<std::convert::Infallible>(true);
         assert!(tx.poll_ready(&cx).is_pending());
         drop(rx);
         assert_eq!(count(), 1);
         drop(tx);
 
-        let (tx, mut rx) = channel(false);
+        let (tx, mut rx) = channel::<std::convert::Infallible>(false);
         assert!(rx.poll_next(&cx).is_pending());
         drop(tx);
         assert_eq!(count(), 2);

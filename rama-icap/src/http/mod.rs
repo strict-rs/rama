@@ -2704,10 +2704,10 @@ impl Error {
         }
     }
 
-    fn http_body(source: BoxError) -> Self {
+    fn http_body(source: impl Into<BoxError>) -> Self {
         Self {
             kind: ErrorKind::HttpBody,
-            source: Some(source),
+            source: Some(source.into()),
         }
     }
 

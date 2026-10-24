@@ -32,13 +32,13 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-pub(super) enum SendRequest<Body> {
+pub(super) enum SendRequest<Body: StreamingBody> {
     Http1(Mutex<http1::SendRequest<Body>>),
     Http2(http2::SendRequest<Body>),
     Http3(http3::SendRequest<Body>),
 }
 
-impl<Body: fmt::Debug> fmt::Debug for SendRequest<Body> {
+impl<Body: StreamingBody + fmt::Debug> fmt::Debug for SendRequest<Body> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut f = f.debug_tuple("SendRequest");
         match self {
@@ -50,7 +50,7 @@ impl<Body: fmt::Debug> fmt::Debug for SendRequest<Body> {
 }
 
 /// Internal http sender used to send the actual requests.
-pub struct HttpClientService<Body> {
+pub struct HttpClientService<Body: StreamingBody> {
     pub(super) sender: SendRequest<Body>,
     pub(super) extensions: Extensions,
 }
@@ -77,7 +77,7 @@ impl SendAttempts {
 /// Record `err` as unprocessed when the request never reached the peer
 /// (its dispatcher was already closed, or dropped it unsent), or the h2
 /// peer refused it (`REFUSED_STREAM`, or a `GOAWAY` not covering it).
-fn note_unprocessed(attempts: Option<&SendAttempts>, err: &HttpError) {
+fn note_unprocessed<E>(attempts: Option<&SendAttempts>, err: &HttpError<E>) {
     if let Some(attempts) = attempts
         && (err.is_canceled() || err.is_closed() || err.is_refused())
     {
@@ -96,7 +96,10 @@ fn note_http3_unprocessed(attempts: Option<&SendAttempts>, err: &Http3Error) {
 
 impl<Body> Service<Request<Body>> for HttpClientService<Body>
 where
-    Body: StreamingBody<Data: Send + 'static, Error: Into<BoxError>> + Unpin + Send + 'static,
+    Body: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Unpin
+        + Send
+        + 'static,
 {
     type Output = Response;
     type Error = BoxError;
@@ -146,7 +149,9 @@ where
             SendRequest::Http3(sender) => {
                 let mut sender = sender.clone();
                 match Box::pin(sender.send_request(req)).await {
-                    Ok(response) => response,
+                    Ok(response) => {
+                        response.map(|body| ResponseBody::new(body.map_err(classify_http_error)))
+                    }
                     Err(error) => {
                         note_http3_unprocessed(attempts.as_deref(), &error);
                         mark_broken_if_closed(
@@ -178,7 +183,19 @@ where
                 match result {
                     Ok(resp) => {
                         cancel_guard.disarm();
-                        resp
+                        // Evict upgraded connections before releasing their response lease.
+                        if resp.extensions().contains::<OnUpgrade>()
+                            || resp.extensions().contains::<ConnectionClose>()
+                        {
+                            mark_broken(&self.extensions);
+                        }
+                        let extensions = self.extensions.clone();
+                        resp.map(|body| {
+                            ResponseBody::new(OnIncompleteBody::new(
+                                body.map_err(classify_http_error),
+                                move || mark_broken(&extensions),
+                            ))
+                        })
                     }
                     Err(err) => {
                         // h1 has no request-level recovery: any send/receive error
@@ -205,7 +222,9 @@ where
                     return Err(classify_http_error(err));
                 }
                 match sender.send_request(req).await {
-                    Ok(resp) => resp,
+                    Ok(resp) => {
+                        resp.map(|body| ResponseBody::new(body.map_err(classify_http_error)))
+                    }
                     Err(err) => {
                         mark_broken_if_closed(sender.is_closed(), &self.extensions);
                         note_unprocessed(attempts.as_deref(), &err);
@@ -219,41 +238,19 @@ where
             }
         };
 
-        // Keep classification inside the existing erased body, without an
-        // additional allocation or observing successful body frames.
-        let resp = resp.map(|body| body.map_err(classify_http_error));
-
-        match &self.sender {
-            SendRequest::Http1(_) => {
-                // Evict upgraded h1 connections before the response can release its pool lease.
-                if resp.extensions().contains::<OnUpgrade>()
-                    || resp.extensions().contains::<ConnectionClose>()
-                {
-                    mark_broken(&self.extensions);
-                }
-                // An h1 connection is only reusable once its response body is read
-                // to end-of-stream: evict it the moment the body is abandoned or
-                // errors, before the pool can hand it to the next request.
-                let extensions = self.extensions.clone();
-                Ok(resp.map(|body| {
-                    ResponseBody::new(OnIncompleteBody::new(body, move || {
-                        mark_broken(&extensions)
-                    }))
-                }))
-            }
-            // h2 recovers per stream: an abandoned body resets only its stream.
-            SendRequest::Http2(_) | SendRequest::Http3(_) => Ok(resp.map(ResponseBody::new)),
-        }
+        Ok(resp)
     }
 }
 
 // Preserve the same provenance for response-head and streaming-body failures.
 // Classification never authorizes replay of a sent request.
 // Source traversal is bounded even for cyclic application errors.
-fn classify_http_error(error: HttpError) -> BoxError {
+fn classify_http_error<E: std::error::Error + Send + Sync + 'static>(
+    error: HttpError<E>,
+) -> BoxError {
     if error_chain(&error).any(|cause| {
         cause
-            .downcast_ref::<HttpError>()
+            .downcast_ref::<HttpError<E>>()
             .is_some_and(HttpError::is_user)
     }) {
         return ConnectionError::local(error, ConnectionErrorKind::Other).into_box_error();
@@ -330,13 +327,13 @@ fn mark_broken(extensions: &Extensions) {
         .mark_broken();
 }
 
-impl<B> ExtensionsRef for HttpClientService<B> {
+impl<B: StreamingBody> ExtensionsRef for HttpClientService<B> {
     fn extensions(&self) -> &Extensions {
         &self.extensions
     }
 }
 
-impl<Body> HttpClientService<Body> {
+impl<Body: StreamingBody> HttpClientService<Body> {
     /// Build an HTTP/3 service on an established QUIC connection and drive its critical streams.
     pub(super) fn http3(
         input: QuicConnection,
@@ -579,7 +576,10 @@ mod tests {
                     ConnectionErrorKind::Unavailable
                 }
             );
-            assert!(error_chain(error.as_ref()).any(|error| error.is::<HttpError>()));
+            assert!(
+                error_chain(error.as_ref())
+                    .any(|error| error.is::<HttpError<rama_core::error::ArcError>>())
+            );
             peer.await.unwrap();
         }
     }

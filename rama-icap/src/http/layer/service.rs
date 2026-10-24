@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::VecDeque, future::poll_fn, pin::Pin, sync::A
 use rama_core::{
     Layer, Service,
     bytes::Bytes,
-    error::{BoxError, BoxErrorExt as _, ErrorContext as _, ErrorExt as _},
+    error::{ArcError, BoxError, BoxErrorExt as _, ErrorContext as _, ErrorExt as _},
     extensions::{Extension, ExtensionsRef},
     futures::{StreamExt as _, stream},
     io::Io,
@@ -788,7 +788,7 @@ fn body_from_prefix(prefix: VecDeque<Frame<Bytes>>, body: Body) -> Body {
     if prefix.is_empty() {
         return body;
     }
-    let prefix = stream::iter(prefix.into_iter().map(Ok::<_, BoxError>));
+    let prefix = stream::iter(prefix.into_iter().map(Ok::<_, ArcError>));
     Body::from_frame_stream(prefix.chain(BodyStream::new(body)))
 }
 

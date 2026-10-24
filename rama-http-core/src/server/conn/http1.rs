@@ -11,7 +11,7 @@ use rama_core::Service;
 use rama_core::bytes::Bytes;
 use rama_core::extensions::ExtensionsRef;
 use rama_http::io::upgrade::Upgraded;
-use rama_http::{Body, Request, Response};
+use rama_http::{Body, Request, Response, StreamingBody};
 use rama_net::conn::LingeringClose;
 use rama_net::extensions::StreamTransformed;
 use std::task::ready;
@@ -20,12 +20,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::{HeaderReadTimeout, IdleTimeout, timeout::ConnTimer};
 use crate::{body::Incoming as IncomingBody, proto};
 
-type Http1Dispatcher<T, B, S> = proto::h1::Dispatcher<
-    proto::h1::dispatch::Server<S, IncomingBody>,
-    B,
-    T,
-    proto::ServerTransaction,
->;
+type Http1Dispatcher<T, B, S> =
+    proto::h1::Dispatcher<proto::h1::dispatch::Server<S, B>, B, T, proto::ServerTransaction>;
 
 pin_project_lite::pin_project! {
     /// A [`Future`] representing an HTTP/1 connection, bound to a
@@ -35,11 +31,21 @@ pin_project_lite::pin_project! {
     /// To drive HTTP on this connection this future **must be polled**, typically with
     /// `.await`. If it isn't polled, no progress will be made on this connection.
     #[must_use = "futures do nothing unless polled"]
-    pub struct Connection<T, S>
+    pub struct Connection<T, S, B = Body>
     where
-        S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+        B: StreamingBody,
+        B: Send,
+        B: Unpin,
+        B: 'static,
+        B::Data: Send,
+        B::Data: 'static,
+        B::Error: std::error::Error,
+        B::Error: Send,
+        B::Error: Sync,
+        B::Error: 'static,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible>,
     {
-        conn: Http1Dispatcher<T, Body, S>,
+        conn: Http1Dispatcher<T, B, S>,
     }
 }
 
@@ -107,18 +113,26 @@ pub struct Parts<T, S> {
 
 // ===== impl Connection =====
 
-impl<I, S> fmt::Debug for Connection<I, S>
+impl<I, S, B> fmt::Debug for Connection<I, S, B>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + Unpin
+        + 'static,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection").finish()
     }
 }
 
-impl<I, S> Connection<I, S>
+impl<I, S, B> Connection<I, S, B>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + Unpin
+        + 'static,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible> + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
     /// Start a graceful shutdown process for this connection.
@@ -160,7 +174,10 @@ where
     /// upgrade. Once the upgrade is completed, the connection would be "done",
     /// but it is not desired to actually shutdown the IO object. Instead you
     /// would take it back using `into_parts`.
-    pub fn poll_without_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>>
+    pub fn poll_without_shutdown(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<crate::Result<(), B::Error>>
     where
         S: Unpin,
     {
@@ -173,7 +190,7 @@ where
     /// # Error
     ///
     /// This errors if the underlying connection protocol is not HTTP/1.
-    pub fn without_shutdown(self) -> impl Future<Output = crate::Result<Parts<I, S>>> {
+    pub fn without_shutdown(self) -> impl Future<Output = crate::Result<Parts<I, S>, B::Error>> {
         let mut this = Some(self);
         std::future::poll_fn(move |cx| {
             if let Some(Self { mut conn }) = this.take() {
@@ -186,16 +203,14 @@ where
                     }
                 }
             } else {
-                Poll::Ready(Err(
-                    crate::Error::new_parse_internal().with_display(
-                        "h1 server connection w/o shutdown: poll: inner connection already taken: poll after ready?",
-                    )))
+                Poll::Ready(Err(crate::Error::new_parse_internal()
+                    .with(crate::StateFailure::ServerConnectionConsumed)))
             }
         })
     }
 
     /// Enable this connection to support higher-level HTTP upgrades.
-    pub fn with_upgrades(self) -> UpgradeableConnection<I, S>
+    pub fn with_upgrades(self) -> UpgradeableConnection<I, S, B>
     where
         I: Send,
     {
@@ -203,12 +218,16 @@ where
     }
 }
 
-impl<I, S> Future for Connection<I, S>
+impl<I, S, B> Future for Connection<I, S, B>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + Unpin
+        + 'static,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible> + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
-    type Output = crate::Result<()>;
+    type Output = crate::Result<(), B::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match ready!(Pin::new(&mut self.conn).poll(cx)) {
@@ -490,9 +509,14 @@ impl Builder {
     /// This returns a Future that must be polled in order for HTTP to be
     /// driven on the connection.
     ///
-    pub fn serve_connection<I, S>(&self, io: I, service: S) -> Connection<I, S>
+    pub fn serve_connection<I, S, B>(&self, io: I, service: S) -> Connection<I, S, B>
     where
-        S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + Unpin
+            + 'static,
+        S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible>
+            + Clone,
         I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
     {
         let timer = ConnTimer::new(self.h1_idle_timeout, self.h1_header_read_timeout);
@@ -500,14 +524,19 @@ impl Builder {
     }
 
     /// Bind a connection whose deadlines already started, as during protocol detection.
-    pub(super) fn serve_connection_with_timer<I, S>(
+    pub(super) fn serve_connection_with_timer<I, S, B>(
         &self,
         io: I,
         service: S,
         mut timer: ConnTimer,
-    ) -> Connection<I, S>
+    ) -> Connection<I, S, B>
     where
-        S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+        B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+            + Send
+            + Unpin
+            + 'static,
+        S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible>
+            + Clone,
         I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
     {
         io.extensions().insert(StreamTransformed {
@@ -559,16 +588,24 @@ impl Builder {
 /// A future binding a connection with a Service with Upgrade support.
 #[must_use = "futures do nothing unless polled"]
 #[expect(missing_debug_implementations)]
-pub struct UpgradeableConnection<T, S>
+pub struct UpgradeableConnection<T, S, B = Body>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible>,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + Unpin
+        + 'static,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible>,
 {
-    pub(super) inner: Option<Connection<T, S>>,
+    pub(super) inner: Option<Connection<T, S, B>>,
 }
 
-impl<I, S> UpgradeableConnection<I, S>
+impl<I, S, B> UpgradeableConnection<I, S, B>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + Unpin
+        + 'static,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible> + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
     /// Start a graceful shutdown process for this connection.
@@ -590,12 +627,16 @@ where
     }
 }
 
-impl<I, S> Future for UpgradeableConnection<I, S>
+impl<I, S, B> Future for UpgradeableConnection<I, S, B>
 where
-    S: Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+    B: StreamingBody<Data: Send + 'static, Error: std::error::Error + Send + Sync + 'static>
+        + Send
+        + Unpin
+        + 'static,
+    S: Service<Request<IncomingBody<B::Error>>, Output = Response<B>, Error = Infallible> + Clone,
     I: AsyncRead + AsyncWrite + Send + Unpin + ExtensionsRef + 'static,
 {
-    type Output = crate::Result<()>;
+    type Output = crate::Result<(), B::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(conn) = self.inner.as_mut() {
@@ -603,10 +644,8 @@ where
                 Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
                 Ok(proto::Dispatched::Upgrade(pending)) => {
                     let Some(Connection { conn }) = self.inner.take() else {
-                        return Poll::Ready(Err(
-                            crate::Error::new_parse_internal().with_display(
-                                "h1 server upgradeable connection: dispatch upgrade: inner connection already taken",
-                            )));
+                        return Poll::Ready(Err(crate::Error::new_parse_internal()
+                            .with(crate::StateFailure::ServerUpgradeConsumed)));
                     };
                     let (io, buf, _) = conn.into_inner();
                     pending.fulfill(Upgraded::new(io, buf));
@@ -1279,7 +1318,11 @@ mod lingering_tests {
             builder: &Builder,
         ) -> Connection<
             ServiceInput<Self>,
-            impl Service<Request<IncomingBody>, Output = Response, Error = Infallible> + Clone,
+            impl Service<
+                Request<IncomingBody<rama_core::error::ArcError>>,
+                Output = Response,
+                Error = Infallible,
+            > + Clone,
         > {
             builder.serve_connection(
                 ServiceInput::new(Self { sent: 0 }),

@@ -1,5 +1,4 @@
 use super::HttpServeResult;
-use rama_core::error::BoxError;
 use rama_http_core::server::conn::auto::Builder as AutoBuilder;
 use rama_http_core::server::conn::http1::Builder as Http1Builder;
 use rama_http_core::server::conn::http2::Builder as Http2Builder;
@@ -16,57 +15,51 @@ impl HttpCoreConnServer for Http2Builder {}
 
 impl HttpCoreConnServer for AutoBuilder {}
 
-/// A utility function to map boxed, potentially http-core errors, to our own error type.
-fn map_boxed_http_core_result(result: Result<(), BoxError>) -> HttpServeResult {
+// This convenience server retains its existing clean-peer-close policy.
+// Callers that need every terminal observation own the core connection future.
+fn map_auto_http_core_result(
+    result: Result<(), rama_http_core::server::conn::auto::AutoConnectionError>,
+) -> HttpServeResult {
+    use rama_http_core::server::conn::auto::{AutoConnectionError, DetectionError};
     match result {
-        Ok(_) => Ok(()),
-        Err(err) => match err.downcast::<rama_http_core::Error>() {
-            Ok(err) => map_http_core_err_to_result(*err),
-            Err(err) => match err.downcast::<std::io::Error>() {
-                Ok(err) => {
-                    if is_connection_error(&err) {
-                        Ok(())
-                    } else {
-                        Err(err.into())
-                    }
-                }
-                Err(err) => Err(err),
-            },
-        },
+        Ok(()) => Ok(()),
+        Err(AutoConnectionError::Http1(error)) => map_http_core_result(Err(error)),
+        Err(AutoConnectionError::Http2(error)) => map_http_core_result(Err(error)),
+        Err(AutoConnectionError::Detection(DetectionError::Io(error)))
+            if is_connection_error(&error) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
-/// A utility function to map http-core errors to our own error type.
-fn map_http_core_result(result: rama_http_core::Result<()>) -> HttpServeResult {
-    match result {
-        Ok(_) => Ok(()),
-        Err(err) => map_http_core_err_to_result(err),
+fn map_http_core_result<E: Error + Send + Sync + 'static>(
+    result: rama_http_core::Result<(), E>,
+) -> HttpServeResult {
+    use rama_http_core::Cause;
+    let error = match result {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    // A second failure during required cleanup is never a clean close.
+    if !error.preceding().is_empty()
+        || matches!(error.cause_ref(), Some(Cause::Finalization { .. }))
+    {
+        return Err(error.into());
     }
-}
-
-/// A utility function to map http-core errors to our own error type.
-fn map_http_core_err_to_result(err: rama_http_core::Error) -> HttpServeResult {
-    if err.is_canceled() || err.is_closed() {
+    if error.is_canceled() || error.is_closed() {
         return Ok(());
     }
-
-    if let Some(source_err) = err.source() {
-        if let Some(h2_err) = source_err.downcast_ref::<rama_http_core::h2::Error>() {
-            if h2_err.is_go_away() || h2_err.is_io() {
-                return Ok(());
-            }
-        } else if let Some(io_err) = source_err.downcast_ref::<std::io::Error>()
-            && is_connection_error(io_err)
-        {
-            return Ok(());
-        }
+    match error.cause_ref() {
+        Some(Cause::Http2(cause)) if cause.is_go_away() || cause.is_io() => Ok(()),
+        Some(Cause::Io(cause)) if is_connection_error(cause) => Ok(()),
+        _ => Err(error.into()),
     }
-
-    Err(err.into())
 }
 
 mod private {
-    use super::{map_boxed_http_core_result, map_http_core_result};
+    use super::{map_auto_http_core_result, map_http_core_result};
     use crate::server::HttpServeResult;
 
     use rama_core::Service;
@@ -196,7 +189,7 @@ mod private {
             let service = RamaHttpService::new(service);
             let stream = Box::pin(io);
             let mut conn = pin!(self.serve_connection_with_upgrades(stream, service));
-            serve_until_graceful_shutdown!(conn, guard, graceful, map_boxed_http_core_result)
+            serve_until_graceful_shutdown!(conn, guard, graceful, map_auto_http_core_result)
         }
     }
 }

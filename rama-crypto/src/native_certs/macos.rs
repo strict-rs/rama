@@ -22,7 +22,7 @@ pub(super) fn load_native_certs() -> CertificateResult {
             Ok(iter) => iter,
             Err(err) => {
                 result.os_error(
-                    err.into(),
+                    err,
                     match domain {
                         Domain::User => "failed to load user trust settings",
                         Domain::Admin => "failed to load admin trust settings",
@@ -45,7 +45,7 @@ pub(super) fn load_native_certs() -> CertificateResult {
             let trusted = match ts.tls_trust_settings_for_certificate(&cert) {
                 Ok(trusted) => trusted.unwrap_or(TrustSettingsForCertificate::TrustRoot),
                 Err(err) => {
-                    result.os_error(err.into(), "certificate not trusted");
+                    result.os_error(err, "certificate not trusted");
                     continue;
                 }
             };

@@ -1,8 +1,8 @@
-use core::net::IpAddr;
-use rama_core::{
-    error::{BoxError, BoxErrorExt as _},
-    extensions::Extension,
+use core::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
+use rama_core::extensions::Extension;
 
 use crate::address::ip::IntoCanonicalIpAddr as _;
 
@@ -47,20 +47,58 @@ pub enum ConnectIpMode {
     Ipv6,
 }
 
+/// A destination rejected by the selected wire-address-family policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamilyRefusal {
+    Ipv4 {
+        requested: IpAddr,
+        canonical: Ipv4Addr,
+    },
+    Ipv6 {
+        requested: IpAddr,
+        canonical: Ipv6Addr,
+    },
+}
+
+impl fmt::Display for AddressFamilyRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ipv4 {
+                requested,
+                canonical,
+            } => write!(
+                f,
+                "IPv4 address {canonical} (requested as {requested}) is not allowed"
+            ),
+            Self::Ipv6 {
+                requested,
+                canonical,
+            } => write!(
+                f,
+                "IPv6 address {canonical} (requested as {requested}) is not allowed"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for AddressFamilyRefusal {}
+
 impl ConnectIpMode {
     /// Validate the destination's wire family and return its canonical address.
     ///
     /// Shared by IP-literal connectors and DNS address selection. Mapped IPv6
     /// addresses become IPv4 before applying the connection policy.
-    pub fn validate_ip(self, ip: IpAddr) -> Result<IpAddr, BoxError> {
-        let ip = ip.into_canonical_ip_addr();
+    pub fn validate_ip(self, requested: IpAddr) -> Result<IpAddr, AddressFamilyRefusal> {
+        let ip = requested.into_canonical_ip_addr();
         match (ip, self) {
-            (IpAddr::V4(_), Self::Ipv6) => {
-                Err(BoxError::from_static_str("IPv4 address is not allowed"))
-            }
-            (IpAddr::V6(_), Self::Ipv4) => {
-                Err(BoxError::from_static_str("IPv6 address is not allowed"))
-            }
+            (IpAddr::V4(canonical), Self::Ipv6) => Err(AddressFamilyRefusal::Ipv4 {
+                requested,
+                canonical,
+            }),
+            (IpAddr::V6(canonical), Self::Ipv4) => Err(AddressFamilyRefusal::Ipv6 {
+                requested,
+                canonical,
+            }),
             _ => Ok(ip),
         }
     }
@@ -68,22 +106,46 @@ impl ConnectIpMode {
 
 #[cfg(test)]
 mod tests {
-    use super::ConnectIpMode;
+    use super::{AddressFamilyRefusal, ConnectIpMode};
     use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
-    fn connect_ip_modes_classify_canonical_wire_families() {
+    fn connect_ip_modes_classify_canonical_wire_families()
+    -> Result<(), (ConnectIpMode, IpAddr, Result<IpAddr, AddressFamilyRefusal>)> {
         let ipv4 = Ipv4Addr::LOCALHOST;
         let ipv6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
         for address in [IpAddr::V4(ipv4), IpAddr::V6(ipv4.to_ipv6_mapped())] {
             for mode in [ConnectIpMode::Dual, ConnectIpMode::Ipv4] {
-                assert_eq!(mode.validate_ip(address).unwrap(), IpAddr::V4(ipv4));
+                let received = mode.validate_ip(address);
+                if received != Ok(IpAddr::V4(ipv4)) {
+                    return Err((mode, address, received));
+                }
             }
-            ConnectIpMode::Ipv6.validate_ip(address).unwrap_err();
+            let received = ConnectIpMode::Ipv6.validate_ip(address);
+            if received
+                != Err(AddressFamilyRefusal::Ipv4 {
+                    requested: address,
+                    canonical: ipv4,
+                })
+            {
+                return Err((ConnectIpMode::Ipv6, address, received));
+            }
         }
         for mode in [ConnectIpMode::Dual, ConnectIpMode::Ipv6] {
-            assert_eq!(mode.validate_ip(ipv6).unwrap(), ipv6);
+            let received = mode.validate_ip(ipv6);
+            if received != Ok(ipv6) {
+                return Err((mode, ipv6, received));
+            }
         }
-        ConnectIpMode::Ipv4.validate_ip(ipv6).unwrap_err();
+        let received = ConnectIpMode::Ipv4.validate_ip(ipv6);
+        if received
+            != Err(AddressFamilyRefusal::Ipv6 {
+                requested: ipv6,
+                canonical: Ipv6Addr::LOCALHOST,
+            })
+        {
+            return Err((ConnectIpMode::Ipv4, ipv6, received));
+        }
+        Ok(())
     }
 }
